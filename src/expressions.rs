@@ -103,9 +103,10 @@ pub fn validate_plan(plan: &Plan) -> Result<()> {
     }
     Ok(())
 }
-pub fn emoticons(cfg: &Config) -> Result<Value> {
+/// The operator's text-emoticon pool, in file order. Empty when none is configured.
+pub fn emoticons(cfg: &Config) -> Result<Vec<String>> {
     let Some(path) = cfg.expressions.as_ref().and_then(|c| c.emoticons.as_ref()) else {
-        return Ok(Value::Null);
+        return Ok(vec![]);
     };
     if fs::metadata(path)?.len() > 128 * 1024 {
         bail!("emoticons_too_large")
@@ -114,14 +115,43 @@ pub fn emoticons(cfg: &Config) -> Result<Value> {
     let items = v["items"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("emoticons_invalid"))?;
+    let texts: Vec<String> = items
+        .iter()
+        .filter_map(|i| i["text"].as_str().map(str::trim).map(str::to_owned))
+        .collect();
     if items.len() > 256
-        || items
+        || texts.len() != items.len()
+        || texts
             .iter()
-            .any(|i| i["text"].as_str().is_none_or(|s| s.chars().count() > 100))
+            .any(|s| s.is_empty() || s.chars().count() > 100 || s.contains('\n'))
     {
         bail!("emoticons_invalid")
     }
-    Ok(json!(items))
+    Ok(texts)
+}
+/// Code-side uniform random pick of one text emoticon per reply, like the stickers: the model only
+/// places it, so no tokens or tool round trips are spent choosing. `skip` (the room's latest
+/// reply) avoids the same face twice in a row while the pool has an alternative.
+pub fn pick_emoticon(cfg: &Config, skip: &str) -> Result<Option<String>> {
+    let all = emoticons(cfg)?;
+    let fresh: Vec<&String> = all.iter().filter(|t| !skip.contains(t.as_str())).collect();
+    let pool: Vec<&String> = if fresh.is_empty() {
+        all.iter().collect()
+    } else {
+        fresh
+    };
+    if pool.is_empty() {
+        return Ok(None);
+    }
+    let roll = u64::from_str_radix(&crate::adapters::nonce()?[..16], 16)?;
+    Ok(Some(pool[(roll % pool.len() as u64) as usize].clone()))
+}
+/// The reply carrying its picked emoticon: kept where the model placed it, else appended.
+pub fn with_emoticon(reply: &str, emoticon: Option<&str>) -> String {
+    match emoticon {
+        Some(e) if !reply.contains(e) => format!("{} {e}", reply.trim_end()),
+        _ => reply.to_owned(),
+    }
 }
 pub fn prepare(cfg: &Config, key: &str, id: &str) -> Result<Value> {
     if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {

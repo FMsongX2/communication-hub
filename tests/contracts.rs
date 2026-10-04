@@ -1176,12 +1176,60 @@ fn concurrent_ack_intro_suppresses_a_second_intro_in_the_final_reply() {
     let c = config(t.path());
     let s = Store::open(c.state.clone()).unwrap();
     let marker = "이 방에는 자기소개를 실제 전송한 기록이 있어";
-    let (plain, _, _) = worker::instructions(&c, &s, &event(), false).unwrap();
-    let (with_ack, _, _) = worker::instructions(&c, &s, &event(), true).unwrap();
+    let (plain, _, _) = worker::instructions(&c, &s, &event(), false, None).unwrap();
+    let (with_ack, _, _) = worker::instructions(&c, &s, &event(), true, None).unwrap();
     assert!(!plain.contains(marker));
     assert!(with_ack.contains(marker));
     // The model is told the runner attaches stickers, so it never picks or mentions one.
     assert!(!plain.contains("sticker_id"));
+    // With no pool the model is told to use no face; with one it gets exactly the picked face.
+    assert!(plain.contains("특수문자 표정을 넣지 마"));
+    let (faced, _, _) = worker::instructions(&c, &s, &event(), false, Some("(˶>⩊<˶)")).unwrap();
+    assert!(faced.contains("(˶>⩊<˶) 하나야") && !faced.contains("표정을 넣지 마"));
+}
+fn emoticon_pool(root: &Path, faces: &[&str]) -> std::path::PathBuf {
+    let path = root.join("emoticons.json");
+    let items: Vec<Value> = faces.iter().map(|f| json!({"text":f})).collect();
+    std::fs::write(&path, serde_json::to_vec(&json!({"items":items})).unwrap()).unwrap();
+    path
+}
+#[test]
+fn emoticon_is_picked_by_code_and_appended_only_when_the_model_left_it_out() {
+    use communication_hub::expressions;
+    let t = TempDir::new().unwrap();
+    let mut c = config(t.path());
+    assert_eq!(expressions::pick_emoticon(&c, "").unwrap(), None);
+    let faces = ["(ෆ˙ᵕ˙ෆ)♡", "(˶>⩊<˶)", "(๑ˊ͈ ꇴ ˋ͈)♡"];
+    c.expressions = Some(communication_hub::config::ExpressionConfig {
+        catalog: t.path().join("unused.json"),
+        emoticons: Some(emoticon_pool(t.path(), &faces)),
+    });
+    let mut picked = std::collections::HashSet::new();
+    for _ in 0..200 {
+        let face = expressions::pick_emoticon(&c, "웅웅! 잠시만~(๑ˊ͈ ꇴ ˋ͈)♡")
+            .unwrap()
+            .unwrap();
+        // The room's latest face is skipped while another one is available.
+        assert_ne!(face, faces[2]);
+        picked.insert(face);
+    }
+    assert_eq!(picked.len(), 2);
+    assert_eq!(
+        expressions::with_emoticon("안녕!", Some(faces[1])),
+        "안녕! (˶>⩊<˶)"
+    );
+    assert_eq!(
+        expressions::with_emoticon("안녕 (˶>⩊<˶) 반가워!", Some(faces[1])),
+        "안녕 (˶>⩊<˶) 반가워!"
+    );
+    assert_eq!(expressions::with_emoticon("안녕!", None), "안녕!");
+    // A malformed pool is refused rather than half-used.
+    std::fs::write(
+        t.path().join("emoticons.json"),
+        br#"{"items":[{"text":"a\nb"}]}"#,
+    )
+    .unwrap();
+    assert!(expressions::pick_emoticon(&c, "").is_err());
 }
 
 fn fake_claude(dir: &Path, result: &str) -> communication_hub::config::YumiConfig {
@@ -1221,11 +1269,16 @@ async fn yumi_call_runs_one_shot_isolated_claude_with_her_prefix() {
         t.path(),
         r#"{"type":"result","subtype":"success","is_error":false,"result":"안녕! 나는 오빠의 여동생 유미야"}"#,
     ));
+    c.expressions = Some(communication_hub::config::ExpressionConfig {
+        catalog: t.path().join("unused.json"),
+        emoticons: Some(emoticon_pool(t.path(), &["(˶>⩊<˶)"])),
+    });
     let s = Store::open(c.state.clone()).unwrap();
     let result = worker::model(&c, &s, &yumi_event()).await.unwrap();
+    // The fake model ignored the picked face, so the hub appended it.
     assert_eq!(
         result["plan"]["reply"],
-        "[System-유미] : 안녕! 나는 오빠의 여동생 유미야"
+        "[System-유미] : 안녕! 나는 오빠의 여동생 유미야 (˶>⩊<˶)"
     );
     let args = std::fs::read_to_string(t.path().join("args.txt")).unwrap();
     let args: Vec<&str> = args.lines().collect();
@@ -1253,6 +1306,7 @@ async fn yumi_call_runs_one_shot_isolated_claude_with_her_prefix() {
             .unwrap();
     let content = input["message"]["content"].as_str().unwrap();
     assert!(content.contains("untrusted_third_party_data") && content.contains("yumi_introduced"));
+    assert!(content.contains(r#""emoticon":"(˶>⩊<˶)""#));
 }
 #[tokio::test]
 async fn yumi_usage_limit_becomes_her_sleeping_reply() {
