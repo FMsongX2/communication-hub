@@ -35,7 +35,9 @@ impl Store {
             CREATE INDEX IF NOT EXISTS call_log_conversation ON call_log(conversation);
             CREATE TABLE IF NOT EXISTS agent_intro(conversation TEXT NOT NULL,agent TEXT NOT NULL,PRIMARY KEY(conversation,agent));
             CREATE TABLE IF NOT EXISTS rooms(conversation TEXT PRIMARY KEY,title TEXT NOT NULL,approved REAL,yui INTEGER NOT NULL DEFAULT 1,yumi INTEGER NOT NULL DEFAULT 1,verified_rows INTEGER,verified_at REAL,seen REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);")?;
+            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS message_sources(conversation TEXT NOT NULL,digest TEXT NOT NULL,source TEXT NOT NULL,occurred REAL NOT NULL);
+            CREATE INDEX IF NOT EXISTS message_sources_room ON message_sources(conversation,digest);")?;
         // Rooms already answered in (a verified name) were in use before the registry existed.
         db.execute(
             "INSERT OR IGNORE INTO rooms(conversation,title,approved,seen) SELECT conversation,title,?1,?1 FROM routes WHERE title IS NOT NULL AND NOT EXISTS(SELECT 1 FROM migrations WHERE name='rooms-v1')",
@@ -128,6 +130,55 @@ impl Store {
         }
         db.execute("INSERT INTO rooms(conversation,title,seen) VALUES(?,?,?) ON CONFLICT(conversation) DO UPDATE SET seen=excluded.seen",params![c.key(),title,now()])?;
         Ok(())
+    }
+    /// The registered room a window title names. The open-room watch sees only the title, so a title
+    /// shared by two registered rooms resolves to nothing rather than a guess.
+    pub fn room_by_title(
+        &self,
+        provider: &str,
+        account: &str,
+        title: &str,
+    ) -> Result<Option<Conversation>> {
+        let db = self.db()?;
+        let mut q = db.prepare("SELECT conversation FROM rooms WHERE title=?")?;
+        let found: Vec<Conversation> = q
+            .query_map([title], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|key| {
+                let [p, a, id]: [String; 3] = serde_json::from_str(&key).ok()?;
+                (p == provider && a == account).then_some(Conversation {
+                    provider: p,
+                    account: a,
+                    id,
+                })
+            })
+            .collect();
+        Ok(match found.as_slice() {
+            [one] => Some(one.clone()),
+            _ => None,
+        })
+    }
+    /// Kakao reports a message through its notification or, for the room in front, through the
+    /// open-room watch. The same text in the same room from the other path within a minute is the
+    /// same message, so only the first report counts.
+    pub fn reported_by_other_source(&self, e: &Event) -> Result<bool> {
+        let db = self.db()?;
+        let digest = crate::event::digest(e.body.trim());
+        let seen = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_sources WHERE conversation=?1 AND digest=?2 AND source<>?3 AND abs(occurred-?4)<=60)",
+            params![e.conversation.key(), digest, e.source, e.occurred_at],
+            |r| r.get::<_, bool>(0),
+        )?;
+        db.execute(
+            "INSERT INTO message_sources(conversation,digest,source,occurred) VALUES(?,?,?,?)",
+            params![e.conversation.key(), digest, e.source, e.occurred_at],
+        )?;
+        db.execute(
+            "DELETE FROM message_sources WHERE occurred<?",
+            [now() - 3600.0],
+        )?;
+        Ok(seen)
     }
     /// The placeholder identity of a room added by name before its first call reveals its ID.
     pub fn named(c: &Conversation, title: &str) -> Conversation {

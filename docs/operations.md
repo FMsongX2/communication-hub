@@ -22,6 +22,8 @@ First verify foreground operation with the owner-approved configuration. On macO
 
 Replace placeholders with your actual paths and put stdout/stderr logs in a private state directory. Use `launchctl bootstrap gui/$(id -u) PATH_TO_PLIST` after validating your settings. Do not run the GUI adapter as a root LaunchDaemon. The receiver requires Full Disk Access; the sender requires Accessibility. With ad-hoc signing (the default), macOS binds those permissions to each build's code hash, so every rebuilt helper must be removed and re-added in System Settings and restarted. Sign with a stable local code-signing identity instead (`CODESIGN_IDENTITY="Your Identity" scripts/build-native.sh OUT`): the grant then follows the bundle identifier and certificate, and rebuilds keep it. A self-signed code-signing certificate in the login keychain works without being marked trusted.
 
+With `kakao.watch_open_room` on, one long-running copy of the sender app runs `--watch-open`. A replaced sender binary takes effect for the watch only after that copy restarts: stop it (`pkill -f 'KakaoReplySender --watch-open'`) and the hub relaunches it from the new binary within 15 s.
+
 ## Inspect and pause
 
 `status` reports dispatch/send gates, in-flight work, aggregate job states, sessions, and the last source heartbeat. Check the timestamp; an old `watching` label alone is not proof of health. `adapters` distinguishes supported operations from planned adapters.

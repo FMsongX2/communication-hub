@@ -71,6 +71,8 @@ pub fn format_reply_as(agent: Agent, body: &str) -> Result<String> {
     }
     Ok(reply)
 }
+pub const NOTIFICATION_SOURCE: &str = "kakao_notification_store";
+pub const OPEN_ROOM_SOURCE: &str = "kakao_open_room";
 pub fn now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -157,8 +159,35 @@ impl Event {
             agent: Agent::Yui,
         })
     }
+    /// A tagged message seen in the room window in front, already resolved to its registered room.
+    /// The window offers no message ID, so each observation gets its own.
+    pub fn from_open_room(v: &Value, conversation: Conversation) -> Result<Self> {
+        let observation = v["observation_id"]
+            .as_str()
+            .filter(|s| {
+                (8..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+            })
+            .ok_or_else(|| anyhow::anyhow!("invalid observation id"))?;
+        Ok(Self {
+            conversation,
+            id: format!("open:{observation}"),
+            body: v["body"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing event field: body"))?
+                .into(),
+            title: v["chat_name"].as_str().unwrap_or("").into(),
+            occurred_at: v["occurred_at"]
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("invalid event timestamp"))?,
+            source: OPEN_ROOM_SOURCE.into(),
+            metadata: json!({"sender_identity":"unverified","actual_mention_verified":false,"observed":"focused_room_window"}),
+            agent: Agent::Yui,
+        })
+    }
     pub fn validate(&self, at: f64, initialized: bool) -> Result<()> {
-        if self.conversation.provider != "kakao" || self.source != "kakao_notification_store" {
+        if self.conversation.provider != "kakao"
+            || ![NOTIFICATION_SOURCE, OPEN_ROOM_SOURCE].contains(&self.source.as_str())
+        {
             bail!("unsupported_event_source")
         }
         if self.conversation.id.is_empty()

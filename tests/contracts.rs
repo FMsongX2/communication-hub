@@ -48,6 +48,7 @@ fn config(root: &Path) -> Config {
             sender_app: root.join("sender.app"),
             sender_ipc: root.join("ipc"),
             prewarm: false,
+            watch_open_room: false,
         },
     }
 }
@@ -1621,4 +1622,105 @@ async fn busy_notice_is_a_fixed_reply_without_a_model() {
             .any(|text| reply == format!("[System-유미] : {text}")),
         "{reply}"
     );
+}
+#[tokio::test]
+async fn open_room_reports_resolve_by_title_and_never_double_a_notified_message() {
+    use communication_hub::daemon;
+    let t = TempDir::new().unwrap();
+    let mut cfg = config(t.path());
+    cfg.kakao.watch_open_room = true;
+    let service = tokio::spawn(daemon::run(cfg.clone(), true));
+    for _ in 0..40 {
+        if cfg.socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    approve_room(&cfg, &event());
+    let open = |title: &str, body: &str, observation: &str| {
+        daemon::request(
+            &cfg.socket,
+            json!({"method":"ingest_kakao","event":{"source":"kakao_open_room","chat_name":title,"body":body,"occurred_at":now(),"observation_id":observation}}),
+        )
+    };
+    let notified = |id: &str, body: &str| {
+        let mut e = event();
+        e.id = id.into();
+        e.body = body.into();
+        daemon::request(&cfg.socket, json!({"method":"ingest","event":e}))
+    };
+    // A call seen in the window in front reaches the room registered under that title.
+    let r = open("fixture", "@[유이] 보고 있을 때", "0f5e2c1a-0001")
+        .await
+        .unwrap();
+    assert_eq!(r["result"]["status"], "queued", "{r}");
+    let calls = Store::open(cfg.state.clone())
+        .unwrap()
+        .calls(None, None, 10)
+        .unwrap()
+        .to_string();
+    assert!(
+        calls.contains("room1") && calls.contains("open:0f5e2c1a-0001"),
+        "{calls}"
+    );
+    // The same message reported again by the other path is one message, in either order.
+    let r = notified("n1", "@[유이] 보고 있을 때").await.unwrap();
+    assert_eq!(r["result"]["status"], "duplicate", "{r}");
+    assert_eq!(
+        notified("n2", "@[유이] 알림 먼저").await.unwrap()["result"]["status"],
+        "queued"
+    );
+    let r = open("fixture", "@[유이] 알림 먼저", "0f5e2c1a-0002")
+        .await
+        .unwrap();
+    assert_eq!(r["result"]["status"], "duplicate", "{r}");
+    // Two different messages are never merged, and an unregistered title is no call.
+    let r = open("fixture", "@[유이] 다른 말", "0f5e2c1a-0003")
+        .await
+        .unwrap();
+    assert_eq!(r["result"]["status"], "queued", "{r}");
+    assert_eq!(
+        open("unknown room", "@[유이] 누구", "0f5e2c1a-0004")
+            .await
+            .unwrap()["ok"],
+        false
+    );
+    // Heartbeats from the watch land in their own status file.
+    daemon::request(
+        &cfg.socket,
+        json!({"method":"ingest_kakao","event":{"kind":"open_room_status","status":"watching_focused_room","at":now()}}),
+    )
+    .await
+    .unwrap();
+    let status = daemon::request(&cfg.socket, json!({"method":"status"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        status["result"]["kakao_open_room"]["status"],
+        "watching_focused_room"
+    );
+    assert_eq!(status["result"]["kakao_source"], json!({}));
+    service.abort();
+}
+#[tokio::test]
+async fn open_room_reports_are_refused_unless_the_watch_is_enabled() {
+    use communication_hub::daemon;
+    let t = TempDir::new().unwrap();
+    let cfg = config(t.path());
+    let service = tokio::spawn(daemon::run(cfg.clone(), true));
+    for _ in 0..40 {
+        if cfg.socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    approve_room(&cfg, &event());
+    let r = daemon::request(
+        &cfg.socket,
+        json!({"method":"ingest_kakao","event":{"source":"kakao_open_room","chat_name":"fixture","body":"@[유이] 안녕","occurred_at":now(),"observation_id":"0f5e2c1a-0009"}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r["ok"], false);
+    service.abort();
 }

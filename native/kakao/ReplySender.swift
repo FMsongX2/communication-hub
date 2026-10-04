@@ -98,9 +98,154 @@ func collectWithTrigger(_ window:AXUIElement,_ trigger:String)->[Node] {
  let visible=collect(window,visibleRowsOnly:true)
  return visible.contains(where:{$0.value==trigger}) ? visible : collect(window)
 }
+// Open-room watch. Kakao posts no notification for the room window the owner is looking at, so a
+// call landing there never reaches the notification receiver. This read-only mode follows
+// KakaoTalk's focused room while KakaoTalk is frontmost and forwards to the hub only new messages
+// that carry a sister's tag. It never types, clicks, focuses or touches the clipboard, so it runs
+// beside one-shot sends without their UI lock. Rows already on screen when a room comes into
+// focus are never forwarded, and the room is read afresh whenever focus leaves it.
+let sisterTags=["[유이]","[유미]"]
+let minuteLabel=try! NSRegularExpression(pattern:"[0-9]{1,2}:[0-9]{2}$")
+func messageTables(_ window:AXUIElement)->[AXUIElement] {
+ var queue=[window],found:[AXUIElement]=[],depth=0
+ while !queue.isEmpty && depth<10 {
+  var next:[AXUIElement]=[]
+  for e in queue {if str(e,kAXRoleAttribute)==kAXTableRole {found.append(e)} else {next.append(contentsOf:children(e))}}
+  queue=next;depth+=1
+ }
+ return found
+}
+func tableRows(_ table:AXUIElement)->[AXUIElement] {attr(table,kAXRowsAttribute) as? [AXUIElement] ?? []}
+// A message row holds its text in one text area; names, minute labels and unread counts are static
+// texts beside it. Rows scrolled out of view expose no children, so they yield nothing.
+func taggedMessages(_ row:AXUIElement)->[String] {
+ collect(row).filter{$0.role==kAXTextAreaRole}.map(\.value).filter{text in
+  sisterTags.contains(where:{text.contains($0)}) && !text.hasPrefix("[System-") && text.count<4000
+ }
+}
+func elementOrNil(_ value:CFTypeRef?)->AXUIElement? {
+ guard let value,CFGetTypeID(value)==AXUIElementGetTypeID() else{return nil}
+ return (value as! AXUIElement)
+}
+func hubSocketPath()->String {
+ let i=CommandLine.arguments.firstIndex(of:"--hub-socket")
+ return i.flatMap{CommandLine.arguments.indices.contains($0+1) ? CommandLine.arguments[$0+1] : nil} ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommunicationHub/hub.sock").path
+}
+func sendToHub(_ item:[String:Any])->Bool {
+ let socketPath=hubSocketPath()
+ guard socketPath.hasPrefix("/"),socketPath.utf8.count<104 else{return false}
+ let fd=socket(AF_UNIX,SOCK_STREAM,0);guard fd>=0 else{return false};defer{close(fd)}
+ var timeout=timeval(tv_sec:1,tv_usec:0),one:Int32=1
+ _=setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,socklen_t(MemoryLayout<timeval>.size))
+ _=setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,socklen_t(MemoryLayout<timeval>.size))
+ _=setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&one,socklen_t(MemoryLayout<Int32>.size))
+ var address=sockaddr_un();address.sun_family=sa_family_t(AF_UNIX);address.sun_len=UInt8(MemoryLayout<sockaddr_un>.size)
+ let pathBytes=Array(socketPath.utf8)+[0]
+ withUnsafeMutableBytes(of:&address.sun_path){$0.copyBytes(from:pathBytes)}
+ let connected=withUnsafePointer(to:&address){$0.withMemoryRebound(to:sockaddr.self,capacity:1){Darwin.connect(fd,$0,socklen_t(MemoryLayout<sockaddr_un>.size))}}
+ guard connected==0,var payload=try? JSONSerialization.data(withJSONObject:["method":"ingest_kakao","event":item]) else{return false}
+ payload.append(10)
+ var sent=0
+ let wrote=payload.withUnsafeBytes{buffer->Bool in
+  while sent<payload.count{let n=Darwin.send(fd,buffer.baseAddress!.advanced(by:sent),payload.count-sent,0);if n<=0{return false};sent+=n};return true
+ }
+ guard wrote else{return false}
+ var reply=Data(),buffer=[UInt8](repeating:0,count:1024)
+ while reply.count<4096 {let n=Darwin.recv(fd,&buffer,buffer.count,0);if n<=0{return false};reply.append(contentsOf:buffer.prefix(n));if reply.contains(10){break}}
+ guard let result=(try? JSONSerialization.jsonObject(with:reply)) as? [String:Any] else{return false}
+ // A permanent rejection is handled; a storage/service failure must retry.
+ return result["ok"] as? Bool == true || result["error"] as? String == "request_rejected"
+}
+func kakaoRoot()->AXUIElement? {
+ let running=NSRunningApplication.runningApplications(withBundleIdentifier:"com.kakao.KakaoTalkMac")
+ return running.count==1 ? AXUIElementCreateApplication(running[0].processIdentifier) : nil
+}
+// Structure only: message text is reduced to its shape unless it is hub traffic (a tag or a reply).
+func probeShape(_ s:String)->String {
+ if s.isEmpty {return ""}
+ if sisterTags.contains(where:{s.contains($0)}) || s.hasPrefix("[System-") {return String(s.prefix(40))}
+ if minuteLabel.firstMatch(in:s,range:NSRange(s.startIndex...,in:s)) != nil && s.count<=16 {return "MINUTE"}
+ if s.allSatisfy(\.isNumber) {return "DIGITS"}
+ return "TEXT(\(s.count))"
+}
+func probeOpenRooms()->Never {
+ var report:[String:Any]=["frontmost_is_kakao":NSWorkspace.shared.frontmostApplication?.bundleIdentifier=="com.kakao.KakaoTalkMac"]
+ if let root=kakaoRoot() {
+  let windows=attr(root,kAXWindowsAttribute) as? [AXUIElement] ?? []
+  report["window_titles"]=windows.map{str($0,kAXTitleAttribute)}
+  report["focused_title"]=elementOrNil(attr(root,kAXFocusedWindowAttribute)).map{str($0,kAXTitleAttribute)} ?? ""
+  report["rooms"]=windows.filter{str($0,kAXTitleAttribute) != "카카오톡"}.prefix(3).map{window->[String:Any] in
+   ["title":str(window,kAXTitleAttribute),"tables":messageTables(window).map{table->[String:Any] in
+    let rows=tableRows(table),visible=attr(table,"AXVisibleRows") as? [AXUIElement] ?? []
+    return ["rows":rows.count,"visible":visible.count,"tail":rows.suffix(6).map{row in
+     collect(row).map{n->[String:Any] in ["role":n.role,"subrole":str(n.element,kAXSubroleAttribute),"value":probeShape(n.value),"title":probeShape(n.title),"description":probeShape(n.description)]}
+    }]
+   }]
+  }
+ } else {report["error"]="kakao_not_running_or_ambiguous"}
+ let output=senderState.appendingPathComponent("open-room-probe.json")
+ try? JSONSerialization.data(withJSONObject:report,options:[.prettyPrinted,.sortedKeys]).write(to:output,options:.atomic)
+ try? FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:output.path)
+ exit(0)
+}
+struct WatchedRoom {let window:AXUIElement;let title:String;let table:AXUIElement;var rowCount:Int;var known:Set<String>}
+var watched:WatchedRoom?=nil
+var undelivered:[(item:[String:Any],attempts:Int)]=[]
+var lastWatchStatusAt=Date.distantPast
+func isSpacer(_ row:AXUIElement)->Bool {collect(row).allSatisfy{$0.role==kAXRowRole || $0.role==kAXCellRole}}
+// Tagged messages in the newest rows; on-screen ones count as already known.
+func recentTagged(_ rows:[AXUIElement])->Set<String> {Set(rows.suffix(30).flatMap(taggedMessages))}
+func watchTick() {
+ undelivered=undelivered.compactMap{entry in sendToHub(entry.item) || entry.attempts>=20 ? nil : (entry.item,entry.attempts+1)}
+ let front=NSWorkspace.shared.frontmostApplication?.bundleIdentifier=="com.kakao.KakaoTalkMac"
+ if Date().timeIntervalSince(lastWatchStatusAt)>=5 {
+  if sendToHub(["kind":"open_room_status","status":front ? "watching_focused_room":"kakao_in_background","at":Date().timeIntervalSince1970]) {lastWatchStatusAt=Date()}
+ }
+ guard front,let root=kakaoRoot(),let window=elementOrNil(attr(root,kAXFocusedWindowAttribute)) else{watched=nil;return}
+ let title=str(window,kAXTitleAttribute)
+ guard !title.isEmpty,title != "카카오톡" else{watched=nil;return}
+ guard var room=watched,CFEqual(room.window,window),room.title==title else {
+  // A newly focused room: what is already there is history, never a new call.
+  let tables=messageTables(window)
+  if tables.count==1 {
+   let rows=tableRows(tables[0])
+   watched=WatchedRoom(window:window,title:title,table:tables[0],rowCount:rows.count,known:recentTagged(rows))
+  } else {watched=nil}
+  return
+ }
+ // One row-list read per tick; rows are only opened when the list has changed length.
+ let rows=tableRows(room.table)
+ if rows.count==room.rowCount {return}
+ defer{room.rowCount=rows.count;room.known.formUnion(recentTagged(rows));watched=room}
+ // New messages are appended above the room's trailing spacer row (a bare cell), so a list grown
+ // by k holds them in the k rows before that spacer. History loaded at the top only grows the list
+ // while the bottom is scrolled away, and rows out of view expose no text.
+ let added=rows.count-room.rowCount
+ guard added>0,added<=20 else{return}
+ let end=isSpacer(rows[rows.count-1]) ? rows.count-1 : rows.count
+ for row in rows[max(0,end-added)..<end] {
+  for text in taggedMessages(row) where !room.known.contains(text) {
+   room.known.insert(text)
+   let item:[String:Any]=["source":"kakao_open_room","chat_name":title,"body":text,"occurred_at":Date().timeIntervalSince1970,"observation_id":UUID().uuidString.lowercased()]
+   if !sendToHub(item) {undelivered.append((item,0))}
+  }
+ }
+}
+func runOpenRoomWatch()->Never {
+ let lock=open(senderState.appendingPathComponent("open-room-watch.lock").path,O_CREAT|O_RDWR,0o600)
+ guard lock>=0,flock(lock,LOCK_EX|LOCK_NB)==0 else{exit(0)}
+ let watcher=NSApplication.shared
+ watcher.setActivationPolicy(.accessory)
+ let timer=Timer(timeInterval:0.4,repeats:true){_ in watchTick()}
+ RunLoop.main.add(timer,forMode:.common)
+ watcher.run()
+ exit(0)
+}
 guard AXIsProcessTrusted() else{finish("held","accessibility_permission_required")}
 if CommandLine.arguments.contains("--check"){finish("ready")}
 try FileManager.default.createDirectory(at:senderState,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
+if CommandLine.arguments.contains("--probe-open"){probeOpenRooms()}
+if CommandLine.arguments.contains("--watch-open"){runOpenRoomWatch()}
 let uiLock=open(senderState.appendingPathComponent("ui-send.lock").path,O_CREAT|O_RDWR,0o600)
 guard uiLock>=0,flock(uiLock,LOCK_EX|LOCK_NB)==0 else{finish("held","sender_busy")}
 let raw:Data

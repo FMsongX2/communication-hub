@@ -177,6 +177,27 @@ pub async fn run(cfg: Config, no_receiver: bool) -> Result<()> {
                         .status()
                         .await;
                 }
+                // The open-room watch lives in the sender app, which already holds Accessibility;
+                // its own lock keeps a relaunch from starting a second copy.
+                let watch = crate::config::json_file(&cfg.state.join("source-kakao-open.json"))
+                    .unwrap_or(json!({}));
+                if cfg.kakao.enabled
+                    && cfg.kakao.watch_open_room
+                    && now() - watch["received_at"].as_f64().unwrap_or(0.0) > 15.0
+                {
+                    let _ = tokio::process::Command::new("/usr/bin/open")
+                        .args(["-n", "-g"])
+                        .arg(&cfg.kakao.sender_app)
+                        .args(["--args", "--watch-open", "--hub-socket"])
+                        .arg(&cfg.socket)
+                        .arg("--ipc-dir")
+                        .arg(&cfg.kakao.sender_ipc)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .kill_on_drop(true)
+                        .status()
+                        .await;
+                }
                 tokio::time::sleep(Duration::from_secs(15)).await;
             }
         }))
@@ -229,7 +250,7 @@ fn handle(
 ) -> Result<Value> {
     match v["method"].as_str() {
         Some("status") => Ok(
-            json!({"service":"communication-hub","pid":std::process::id(),"runtime":"rust","dispatch_enabled":active.load(Ordering::SeqCst),"external_auto_send":sending.load(Ordering::SeqCst),"processing":processing.load(Ordering::SeqCst),"model":cfg.model,"effort":cfg.effort,"service_tier":cfg.service_tier,"store":store.status()?,"kakao_source":crate::config::json_file(&cfg.state.join("source-kakao.json"))?}),
+            json!({"service":"communication-hub","pid":std::process::id(),"runtime":"rust","dispatch_enabled":active.load(Ordering::SeqCst),"external_auto_send":sending.load(Ordering::SeqCst),"processing":processing.load(Ordering::SeqCst),"model":cfg.model,"effort":cfg.effort,"service_tier":cfg.service_tier,"store":store.status()?,"kakao_source":crate::config::json_file(&cfg.state.join("source-kakao.json"))?,"kakao_open_room":crate::config::json_file(&cfg.state.join("source-kakao-open.json"))?}),
         ),
         Some("adapters") => Ok(cfg.descriptors()),
         Some("pause") => {
@@ -255,17 +276,35 @@ fn handle(
             cfg.validate_channel("kakao", &cfg.kakao.account)
                 .map_err(|_| Rejected)?;
             let raw = &v["event"];
-            if raw["kind"] == "source_status" {
+            let status_file = match raw["kind"].as_str() {
+                Some("source_status") => Some("source-kakao.json"),
+                Some("open_room_status") => Some("source-kakao-open.json"),
+                _ => None,
+            };
+            if let Some(file) = status_file {
                 atomic(
-                    &cfg.state.join("source-kakao.json"),
+                    &cfg.state.join(file),
                     &json!({"status":raw["status"],"at":raw["at"],"received_at":now()}),
                 )?;
                 return Ok(json!({"status":"heartbeat"}));
             }
+            let event = if raw["source"] == crate::event::OPEN_ROOM_SOURCE {
+                if !cfg.kakao.watch_open_room {
+                    return Err(Rejected.into());
+                }
+                // The window shows only its title; an unregistered or ambiguous title is no call.
+                let title = raw["chat_name"].as_str().unwrap_or("");
+                let room = store
+                    .room_by_title("kakao", &cfg.kakao.account, title)?
+                    .ok_or(Rejected)?;
+                Event::from_open_room(raw, room).map_err(|_| Rejected)?
+            } else {
+                Event::from_kakao(raw, &cfg.kakao.account).map_err(|_| Rejected)?
+            };
             ingest(
                 cfg,
                 store,
-                Event::from_kakao(raw, &cfg.kakao.account).map_err(|_| Rejected)?,
+                event,
                 notify,
                 processing.load(Ordering::SeqCst) && sending.load(Ordering::SeqCst),
             )
@@ -312,6 +351,9 @@ fn ingest(
             store.record_rejected(&event.for_agent(agent), reason)?;
         }
         return Err(Rejected.into());
+    }
+    if store.reported_by_other_source(&event)? {
+        return Ok(json!({"status":"duplicate","reason":"reported_by_other_source"}));
     }
     // Only owner-approved rooms are answered; a new room waits on the dashboard for approval.
     store.note_room_seen(&event.conversation, &event.title)?;

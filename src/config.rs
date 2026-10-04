@@ -80,6 +80,10 @@ pub struct KakaoConfig {
     /// chat-list scan; with an older sender it delays the final send instead.
     #[serde(default)]
     pub prewarm: bool,
+    /// Kakao posts no notification for the room window in front, so the sender app (which already
+    /// holds Accessibility) also runs a read-only watch of that room and forwards tagged messages.
+    #[serde(default)]
+    pub watch_open_room: bool,
 }
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
