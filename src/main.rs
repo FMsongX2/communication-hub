@@ -31,6 +31,7 @@ enum Command {
     Adapters,
     Pause,
     Resume,
+    RefreshPolicy,
     Board {
         #[arg(long)]
         open: bool,
@@ -83,6 +84,15 @@ async fn execute() -> Result<()> {
         Command::Adapters => daemon::request(&cfg.socket, json!({"method":"adapters"})).await?,
         Command::Pause => daemon::request(&cfg.socket, json!({"method":"pause"})).await?,
         Command::Resume => daemon::request(&cfg.socket, json!({"method":"resume"})).await?,
+        Command::RefreshPolicy => {
+            let status = daemon::request(&cfg.socket, json!({"method":"status"})).await?;
+            if status["result"]["processing"] == true
+                || status["result"]["dispatch_enabled"] == true
+            {
+                bail!("pause_hub_before_policy_refresh")
+            }
+            worker::refresh_policies(&cfg, &Store::open(cfg.state.clone())?).await?
+        }
         Command::Board { open } => {
             let info =
                 communication_hub::config::json_file(&cfg.state.join("dashboard-status.json"))?;

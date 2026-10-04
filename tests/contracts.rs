@@ -36,6 +36,8 @@ fn config(root: &Path) -> Config {
         effort: worker::EFFORT.into(),
         dispatch_enabled: false,
         dashboard: None,
+        intro_text: None,
+        service_tier: None,
         kakao: KakaoConfig {
             enabled: true,
             account: "owner".into(),
@@ -329,6 +331,7 @@ async fn mock_server(
             }
             let result = match method {
                 "initialize" => json!({}),
+                "thread/inject_items" => json!({}),
                 "thread/start" | "thread/resume" => {
                     json!({"thread":{"id":"fixture-thread","status":{"type":"idle"}},"model":worker::MODEL,"reasoningEffort":worker::EFFORT})
                 }
@@ -831,4 +834,96 @@ fn rejected_calls_are_visible_without_becoming_pending_jobs() {
     assert_eq!(r["items"][0]["status"], "rejected");
     assert_eq!(r["items"][0]["reason"], "room_not_initialized");
     assert_eq!(r["items"][0]["body"], e.body);
+}
+
+#[tokio::test]
+async fn updated_policy_is_injected_as_developer_context_once_per_revision() {
+    use communication_hub::rpc::Rpc;
+    let t = TempDir::new().unwrap();
+    let c = config(t.path());
+    let s = Store::open(c.state.clone()).unwrap();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = mock_server(
+        &c.app_server_socket,
+        calls.clone(),
+        Arc::new(AtomicUsize::new(0)),
+    )
+    .await;
+    let mut rpc = Rpc::connect(&c.app_server_socket).await.unwrap();
+    let e = event();
+    assert!(
+        worker::apply_policy(
+            &mut rpc,
+            &s,
+            &e,
+            "fixture-thread",
+            "owner policy revision one"
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        !worker::apply_policy(
+            &mut rpc,
+            &s,
+            &e,
+            "fixture-thread",
+            "owner policy revision one"
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        worker::apply_policy(
+            &mut rpc,
+            &s,
+            &e,
+            "fixture-thread",
+            "owner policy revision two"
+        )
+        .await
+        .unwrap()
+    );
+    let calls = calls.lock().unwrap();
+    let injects: Vec<_> = calls
+        .iter()
+        .filter(|c| c["method"] == "thread/inject_items")
+        .collect();
+    assert_eq!(injects.len(), 2);
+    assert_eq!(injects[1]["params"]["items"][0]["role"], "developer");
+    assert!(
+        injects[1]["params"]["items"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("revision two")
+    );
+    assert!(!calls.iter().any(|c| c["method"] == "turn/start"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn fast_tier_is_forwarded_without_changing_model_or_effort() {
+    let t = TempDir::new().unwrap();
+    let mut c = config(t.path());
+    c.service_tier = Some("priority".into());
+    let s = Store::open(c.state.clone()).unwrap();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = mock_server(
+        &c.app_server_socket,
+        calls.clone(),
+        Arc::new(AtomicUsize::new(0)),
+    )
+    .await;
+    worker::model(&c, &s, &event()).await.unwrap();
+    let calls = calls.lock().unwrap();
+    for method in ["thread/start", "turn/start"] {
+        let params = &calls.iter().find(|v| v["method"] == method).unwrap()["params"];
+        assert_eq!(params["serviceTier"], "priority");
+        assert_eq!(params["model"], worker::MODEL);
+    }
+    assert_eq!(
+        calls.iter().find(|v| v["method"] == "turn/start").unwrap()["params"]["effort"],
+        "medium"
+    );
+    server.abort();
 }

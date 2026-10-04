@@ -226,7 +226,7 @@ fn handle(
 ) -> Result<Value> {
     match v["method"].as_str() {
         Some("status") => Ok(
-            json!({"service":"communication-hub","pid":std::process::id(),"runtime":"rust","dispatch_enabled":active.load(Ordering::SeqCst),"external_auto_send":sending.load(Ordering::SeqCst),"processing":processing.load(Ordering::SeqCst),"model":cfg.model,"effort":cfg.effort,"store":store.status()?,"kakao_source":crate::config::json_file(&cfg.state.join("source-kakao.json"))?}),
+            json!({"service":"communication-hub","pid":std::process::id(),"runtime":"rust","dispatch_enabled":active.load(Ordering::SeqCst),"external_auto_send":sending.load(Ordering::SeqCst),"processing":processing.load(Ordering::SeqCst),"model":cfg.model,"effort":cfg.effort,"service_tier":cfg.service_tier,"store":store.status()?,"kakao_source":crate::config::json_file(&cfg.state.join("source-kakao.json"))?}),
         ),
         Some("adapters") => Ok(cfg.descriptors()),
         Some("pause") => {

@@ -20,6 +20,10 @@ pub struct Config {
     pub dispatch_enabled: bool,
     #[serde(default)]
     pub dashboard: Option<DashboardConfig>,
+    #[serde(default)]
+    pub intro_text: Option<String>,
+    #[serde(default)]
+    pub service_tier: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardConfig {

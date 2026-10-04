@@ -171,7 +171,7 @@ async fn snapshot(State(b): State<Board>) -> Result<Json<Value>, StatusCode> {
         );
     }
     Ok(Json(
-        json!({"generated_at":at,"hub":{"pid":std::process::id(),"dispatch_enabled":b.active.load(Ordering::SeqCst),"external_auto_send":b.sending.load(Ordering::SeqCst),"processing":b.processing.load(Ordering::SeqCst),"model":b.cfg.model,"effort":b.cfg.effort},"source":source,"backend":{"online":backend_online,"checked_at":backend["checked_at"],"stale":!backend_fresh},"bindings":bindings,"adapters":b.cfg.descriptors(),"counts":b.store.status().map_err(|_|StatusCode::SERVICE_UNAVAILABLE)?,"body_logging":b.store.store_bodies}),
+        json!({"generated_at":at,"hub":{"pid":std::process::id(),"dispatch_enabled":b.active.load(Ordering::SeqCst),"external_auto_send":b.sending.load(Ordering::SeqCst),"processing":b.processing.load(Ordering::SeqCst),"model":b.cfg.model,"effort":b.cfg.effort,"service_tier":b.cfg.service_tier},"source":source,"backend":{"online":backend_online,"checked_at":backend["checked_at"],"stale":!backend_fresh},"bindings":bindings,"adapters":b.cfg.descriptors(),"counts":b.store.status().map_err(|_|StatusCode::SERVICE_UNAVAILABLE)?,"body_logging":b.store.store_bodies}),
     ))
 }
 async fn calls(

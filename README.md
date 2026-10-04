@@ -103,3 +103,9 @@ cargo audit
 Contract tests cover isolation, duplicate intake, restart quarantine, policy reload, mixed RPC notifications, final-answer selection, quota classification, ZIP boundaries, concurrent atomic writes, and retryable storage failure. CI checks Rust on Linux/macOS and compiles native helpers on macOS. See [release review](docs/REVIEW.md) and [adapter extension guide](docs/adapters.md).
 
 MIT licensed. OpenKakao-derived notification and AX selection conventions retain their [MIT attribution](third_party/openkakao/NOTICE.md). Protocol reference: [official Codex App Server documentation](https://learn.chatgpt.com/docs/app-server).
+
+## Live policy refresh and service tier
+
+Each invocation reloads Contact-Other. When the assembled operator context changes, the hub appends a current developer message through `thread/inject_items` before generation. It preserves prior work history instead of replacing the session; merely passing resume overrides is not treated as proof that a loaded model used the revision. To refresh existing idle bindings without generating or sending messages: `communication-hub pause`, `communication-hub refresh-policy`, then `communication-hub resume`. Active backend turns are not modified.
+
+`intro_text` optionally controls the deterministic first acknowledgement's introduction. Fixed acknowledgement variants use brief informal Korean. Configure `service_tier` (e.g. `"priority"` for a catalog-advertised Fast tier) only when your backend/model supports it. The hub forwards it at both session and turn boundaries, independently of `model` and `effort`. Fast can consume more allowance; a configured tier is not a latency guarantee.

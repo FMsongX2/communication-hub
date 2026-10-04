@@ -103,3 +103,9 @@ cargo audit
 계약 시험은 세션 격리·중복·재시작 중 미확인 작업 격리·정책 재로드·RPC 알림 혼재·최종 답변 선택·한도 구분·ZIP 경계·동시 원자 쓰기·일시적 저장 실패를 확인한다. CI는 Linux/macOS의 Rust와 macOS 헬퍼 빌드를 검사한다. [공개 검토 기록](docs/REVIEW.md)과 [어댑터 확장 문서](docs/adapters.md)를 참고한다.
 
 MIT 라이선스. OpenKakao에서 참고한 알림·AX 선택 패턴은 [MIT 출처](third_party/openkakao/NOTICE.md)를 보존한다. 프로토콜 근거는 [공식 Codex App Server 문서](https://learn.chatgpt.com/docs/app-server)다.
+
+## 실행 중 정책 갱신과 Fast 설정
+
+매 호출마다 Contact-Other를 다시 읽는다. 구성한 운영자 지침이 달라지면 생성 전에 `thread/inject_items`로 최신 developer 메시지를 기존 세션에 추가한다. 작업 대화는 유지하며, resume 설정 전달만으로 모델에 적용됐다고 단정하지 않는다. 기존 유휴 세션을 생성·발신 없이 갱신하려면 `communication-hub pause`, `communication-hub refresh-policy`, `communication-hub resume` 순서로 실행한다. 실행기의 활성 turn은 변경하지 않는다.
+
+`intro_text`로 첫 접수 안내의 소개를 설정할 수 있다. 고정 접수 문구는 간결한 한국어 반말을 사용한다. 모델 카탈로그에서 지원하는 경우에만 `service_tier`를 지정한다(예: Fast의 `"priority"`). 세션과 turn 모두에 전달하며 모델·추론 강도와 별개다. Fast는 사용량이 늘 수 있고 설정 수락이 일정 지연 보장은 아니다.

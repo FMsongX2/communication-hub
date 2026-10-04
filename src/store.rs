@@ -29,6 +29,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS legacy_events(scope TEXT,key TEXT,PRIMARY KEY(scope,key));
             CREATE TABLE IF NOT EXISTS migrations(name TEXT PRIMARY KEY);")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS call_log(event_key TEXT PRIMARY KEY,conversation TEXT NOT NULL,message_id TEXT NOT NULL,occurred REAL NOT NULL,trigger_kind TEXT NOT NULL,notification_title TEXT NOT NULL,body TEXT);
+            CREATE TABLE IF NOT EXISTS session_policy(conversation TEXT PRIMARY KEY,hash TEXT NOT NULL,applied REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS call_log_conversation ON call_log(conversation);")?;
         std::fs::set_permissions(&s.path, std::fs::Permissions::from_mode(0o600))?;
         Ok(s)
@@ -51,6 +52,20 @@ impl Store {
     pub fn save_session(&self, c: &Conversation, thread: &str) -> Result<()> {
         self.db()?
             .execute("INSERT INTO sessions VALUES(?,?)", params![c.key(), thread])?;
+        Ok(())
+    }
+    pub fn policy_hash(&self, c: &Conversation) -> Result<Option<String>> {
+        Ok(self
+            .db()?
+            .query_row(
+                "SELECT hash FROM session_policy WHERE conversation=?",
+                [c.key()],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+    pub fn note_policy(&self, c: &Conversation, hash: &str) -> Result<()> {
+        self.db()?.execute("INSERT INTO session_policy VALUES(?,?,?) ON CONFLICT(conversation) DO UPDATE SET hash=excluded.hash,applied=excluded.applied",params![c.key(),hash,now()])?;
         Ok(())
     }
     pub fn route(&self, c: &Conversation) -> Result<Option<String>> {
@@ -80,7 +95,9 @@ impl Store {
             != 0)
     }
     pub fn note_intro(&self, c: &Conversation, reply: &str, receipt: &Value) -> Result<()> {
-        if receipt["status"] == "sent_verified" && reply.contains("Codex[유이]") {
+        if receipt["status"] == "sent_verified"
+            && (reply.contains("Codex[유이]") || reply.contains("여동생 유이"))
+        {
             self.db()?.execute("INSERT INTO routes(conversation,introduced) VALUES(?,1) ON CONFLICT(conversation) DO UPDATE SET introduced=1",[c.key()])?;
         }
         Ok(())

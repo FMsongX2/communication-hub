@@ -22,7 +22,7 @@ function drawSnapshot(s){
  value('source-value',sourceLabels[s.source.status]||'미확인');value('source-sub',s.source.observed_at?`수신 확인 ${relative(s.source.observed_at)}`:'아직 수신 연결 확인 없음');
  value('backend-value',s.backend.online?'연결됨':'미연결');value('backend-sub',s.backend.checked_at?`실행기 확인 ${relative(s.backend.checked_at)}`:'세션 조회 연결 확인 중');
  value('session-value',String(s.bindings.length));value('session-sub',`${s.bindings.filter(x=>x.call_available).length}개 연결에서 호출 대기 가능`);
- value('nav-count',s.bindings.length);value('model-label',`${h.model} · ${h.effort}`);
+ value('nav-count',s.bindings.length);value('model-label',`${h.model} · ${h.effort}${h.service_tier ? " · "+(["priority","fast"].includes(h.service_tier)?"Fast":h.service_tier) : ""}`);
  const tbody=$('bindings');tbody.replaceChildren();
  if(!s.bindings.length){const row=elem('tr');const cell=elem('td','empty','아직 연결된 세션이 없어요. 첫 호출이 들어오면 표시돼요.');cell.colSpan=5;row.append(cell);tbody.append(row);}
  for(const b of s.bindings){
