@@ -1,0 +1,91 @@
+# Communication Hub
+
+[English](README.md) | [한국어](README_ko.md)
+
+여러 앱의 소통·업무 요청을 한곳에서 처리하는 로컬 Rust 서비스. **현재 구현된 어댑터는 카카오톡이다. Discord·Slack·Notion은 확장 대상으로만 선언되어 있으며 아직 연결하지 않았다.** Notion은 채팅창과 동일하게 취급하지 않고 문서·댓글 작업 공간으로 구분한다.
+
+**상태: 실험적 알파.** 실제 macOS에서 텍스트 전송을 검증했다. 새 native 자동 파일 업로드의 전체 흐름 검증은 아직 남아 있다. 새 설치에서는 자동화를 꺼둔다.
+
+```mermaid
+flowchart LR
+    K[카카오톡 어댑터] --> E[공통 이벤트]
+    F[향후 앱 어댑터] -.-> E
+    E --> Q[SQLite 영속 큐]
+    Q --> W[작업 처리와 정책]
+    W --> M[로컬 모델 실행기]
+    M --> P[답변·승인 자료 계획]
+    P --> A[대상 앱 어댑터]
+    A --> R[검증·보류·미확인 기록]
+```
+
+## 기능
+
+- **앱·계정·대화 ID**로 세션과 이벤트를 분리한다.
+- 모델 호출 전에 수신 작업을 저장한다. 모델을 기다리는 동안에도 수신을 이어간다.
+- 전송 시도를 기록하고 재시작 중 미확인 작업을 격리한다. 외부 UI를 포함한 정확히 한 번의 전달을 보장하지는 않는다.
+- 모델 호출과 외부 발신마다 설정한 Contact-Other 원문을 다시 읽는다.
+- 호환되는 로컬 Codex App Server의 Unix 소켓에 WebSocket/JSON-RPC로 연결한다. 모델·추론 강도는 설정 가능하다.
+- 같은 사용자 UID의 로컬 제어 소켓으로 상태·어댑터·일시 중지·재개를 관리한다. 중지는 재시작 후에도 유지한다.
+- 승인된 JSON + ZIP 묶음을 준비하고 경로·크기·CRC·기본 민감정보 패턴을 검사한다.
+- macOS 권한과 접근성 처리는 Swift 헬퍼가 담당한다. 런타임에 Python·가상환경·Orca는 필요하지 않다.
+
+현재 작업 처리기는 하나다. 모든 앱이 이미 동작하는 범용 제품이나 동적 플러그인 로더가 아니라, 어댑터를 확장할 수 있는 초기 기반이다.
+
+## macOS 설치
+
+Rust/Cargo, Xcode Command Line Tools의 `swiftc`, `jq`, 로그인된 카카오톡과 호환되는 로컬 Codex App Server가 필요하다. 사용할 계정에서 지원하는 모델을 지정한다. Rust 시험은 Linux에서도 실행하며 카톡 헬퍼는 macOS 전용이다.
+
+```sh
+git clone https://github.com/FMsongX2/communication-hub.git
+cd communication-hub
+./scripts/setup-macos.sh --model YOUR_SUPPORTED_MODEL_ID
+```
+
+설치 스크립트는 Rust 바이너리와 로컬 서명된 헬퍼 앱을 만들고 `~/Library/Application Support/CommunicationHub`에 비공개 설정을 생성한다. 기존 설정은 덮어쓰지 않는다. **서비스 시작·어댑터 활성화·메시지 발신·macOS 권한 허용은 수행하지 않는다.**
+
+1. 생성된 `config.json`과 `contact-other.md`를 검토한다. 실행기 소켓·계정 별칭·지원 모델·실제로 존재하는 승인 프로젝트 작업 위치를 설정한다.
+2. 시스템 설정에서 **Kakao Mention Receiver에 전체 디스크 접근**, **Kakao Reply Sender에 접근성**을 허용한다. 코드는 카톡으로 동작을 제한하지만 OS 권한 자체는 더 넓다.
+3. `kakao.enabled=true`로 연결한다. 정책·수신 범위를 검토한 다음 `dispatch_enabled`와 `external_auto_send`를 활성화한다. 새 설치에서는 모두 `false`다.
+4. 먼저 전면 실행으로 동작을 확인한다.
+
+```sh
+"$HOME/Library/Application Support/CommunicationHub/bin/communication-hub" run
+```
+
+사용자 LaunchAgent·업데이트·롤백은 [운영 문서](docs/operations.md)를 따른다. 로그인 사용자의 서비스로 실행하며 root 시스템 데몬으로 카톡 UI를 조작하지 않는다. 기존 데스크톱 실행기나 사용자가 시작한 호환 App Server를 연결한다. 인증정보를 추출하거나 실행기 계정을 생성하지 않는다.
+
+## CLI와 호출
+
+```sh
+communication-hub status
+communication-hub adapters
+communication-hub pause
+communication-hub resume
+```
+
+전체 바이너리 경로로 호출하거나 설치 폴더의 `bin`을 PATH에 추가한다. 카톡 첫 호출은 `@[유이]`, 세션이 생긴 방에서는 `@[유이]`와 `[유이]`를 모두 받는다. 태그 없는 메시지는 호출하지 않는다.
+
+전송기는 대상과 호출을 다시 확인하고 동명이거나 모호한 방을 거절한다. 기존 입력 초안을 보관·복원하고 새 발신 말풍선으로 성공을 확인한다. 마우스 포인터는 이동·클릭하지 않는다. 카톡 창을 잠깐 앞으로 가져오고 해당 프로세스에 키를 전달할 수 있다. 잠금·접근성 목록 누락·모호한 대상은 보류한다.
+
+## 경계와 제한
+
+- 큰 대화 기록의 접근성 조회는 느릴 수 있다. 현재 알림 조회 간격은 3초다. 보고 있는 방·음소거·미리보기 비활성화·일부 자기발신은 사용 가능한 알림을 만들지 않을 수 있다. 알림이 없으면 호출할 수 없다.
+- UI 제목과 표시 내용은 방 ID의 암호학적 검증이 아니다. 목록이나 대상이 모호하면 보류한다. 이름 변경·목록 가상화·다른 언어의 UI는 전송을 막을 수 있다.
+- 같은 UID로 실행되는 로컬 프로그램은 제어 클라이언트로 신뢰한다. 파일 권한만으로 사용자 계정 내 악성 프로그램을 격리하지는 않는다.
+- 읽기 전용 모델 실행은 일반 쓰기를 막으며 읽기 전체를 격리하는 것은 아니다. 정책 원문과 민감정보 패턴 검사는 완전한 정보 유출 방지 시스템이 아니다.
+- 등록된 해당 대화의 승인 자료만 첨부할 수 있다. native 파일 업로드는 실험 상태다. 개인 프로필·정렬 그래프·실제 대화·DB·개인 자료·인증정보는 배포하지 않는다.
+- 계정 ID는 설정한 별칭이며 카톡에서 실제 인증된 계정을 자동 판독한 결과가 아니다. 로그인 계정이 바뀌면 범위와 기존 경로를 확인한 뒤 답변을 활성화한다.
+
+## 개발과 검토
+
+```sh
+cargo fmt --check
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo audit
+./scripts/build-native.sh /tmp/communication-hub-native
+```
+
+계약 시험은 세션 격리·중복·재시작 중 미확인 작업 격리·정책 재로드·RPC 알림 혼재·최종 답변 선택·한도 구분·ZIP 경계·동시 원자 쓰기·일시적 저장 실패를 확인한다. CI는 Linux/macOS의 Rust와 macOS 헬퍼 빌드를 검사한다. [공개 검토 기록](docs/REVIEW.md)과 [어댑터 확장 문서](docs/adapters.md)를 참고한다.
+
+MIT 라이선스. OpenKakao에서 참고한 알림·AX 선택 패턴은 [MIT 출처](third_party/openkakao/NOTICE.md)를 보존한다. 프로토콜 근거는 [공식 Codex App Server 문서](https://learn.chatgpt.com/docs/app-server)다.

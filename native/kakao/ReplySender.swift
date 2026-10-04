@@ -1,0 +1,362 @@
+import Foundation
+import AppKit
+import ApplicationServices
+import Darwin
+// Chat-row selection/action sequence follows OpenKakao ax_send (MIT). See third_party/openkakao.
+
+let senderBase=URL(fileURLWithPath:CommandLine.arguments[0]).standardizedFileURL.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+let ipcIndex=CommandLine.arguments.firstIndex(of:"--ipc-dir")
+let ipcOverride=ipcIndex.flatMap{CommandLine.arguments.indices.contains($0+1) ? CommandLine.arguments[$0+1] : nil}
+let senderState=ipcOverride.map{URL(fileURLWithPath:$0)} ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommunicationHub/kakao-ipc")
+var resolvedChatName:String?=nil
+let startedAt=Date()
+var timing:[String:Double]=[:]
+var draftRestored=false
+var textSent=false
+var inputStarted=false
+var attachmentSent=false
+var cleanupClipboard:(()->Void)?=nil
+var openTarget:[String:Any]?=nil
+func stamp(_ key:String){
+ timing[key]=Date().timeIntervalSince(startedAt)
+ if let request=requestKey {
+  let dir=senderState.appendingPathComponent("request-status")
+  try? FileManager.default.createDirectory(at:dir,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
+  let path=dir.appendingPathComponent(request+".json")
+  try? JSONSerialization.data(withJSONObject:["pid":ProcessInfo.processInfo.processIdentifier,"phase":key,"at":Date().timeIntervalSince1970]).write(to:path,options:.atomic)
+  try? FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:path.path)
+ }
+}
+let requestIndex=CommandLine.arguments.firstIndex(of:"--request")
+let requestKey=requestIndex.flatMap{CommandLine.arguments.indices.contains($0+1) ? CommandLine.arguments[$0+1] : nil}
+stamp("started")
+func finish(_ status:String,_ reason:String="") -> Never {
+ cleanupClipboard?();cleanupClipboard=nil
+ var r:[String:Any]=["status":status,"reason":reason]
+ if let name=resolvedChatName {r["verified_chat_name"]=name}
+ if let target=openTarget {r["open_target"]=target}
+ r["timing_seconds"]=timing
+ r["draft_restored"]=draftRestored
+ r["text_sent"]=textSent
+ r["attachment_sent"]=attachmentSent
+ r["elapsed_seconds"]=Date().timeIntervalSince(startedAt)
+ if let key=requestKey,key.range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil {
+ let output=senderState.appendingPathComponent("sender-receipts/"+key+".json")
+ try? FileManager.default.createDirectory(at:output.deletingLastPathComponent(),withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
+ try? JSONSerialization.data(withJSONObject:r).write(to:output,options:.atomic)
+ try? FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:output.path)
+ }
+ FileHandle.standardOutput.write((try! JSONSerialization.data(withJSONObject:r))+Data([10]))
+ exit(status=="sent_verified" || status=="ready" ? 0 : 2)
+}
+func attr(_ e:AXUIElement,_ key:String)->CFTypeRef? {var v:CFTypeRef?;guard AXUIElementCopyAttributeValue(e,key as CFString,&v) == .success else{return nil};return v}
+func str(_ e:AXUIElement,_ key:String)->String {attr(e,key) as? String ?? ""}
+func children(_ e:AXUIElement)->[AXUIElement] {attr(e,kAXChildrenAttribute) as? [AXUIElement] ?? []}
+struct Node {
+ let element:AXUIElement
+ let role:String;let value:String;let title:String;let description:String;let placeholder:String;let enabled:Bool
+ var isComposer:Bool {role==kAXTextAreaRole && (description=="메시지 입력" || title=="메시지 입력" || placeholder=="메시지 입력")}
+ var isSend:Bool {role==kAXButtonRole && (title=="전송" || description=="전송")}
+}
+func collect(_ root:AXUIElement)->[Node] {
+ var result:[Node]=[]
+ let optimizeTableRows=str(root,kAXTitleAttribute)=="카카오톡"
+ let keys=[kAXRoleAttribute,kAXValueAttribute,kAXTitleAttribute,kAXDescriptionAttribute,"AXPlaceholderValue",kAXEnabledAttribute,kAXChildrenAttribute] as CFArray
+ func visit(_ e:AXUIElement,_ depth:Int){
+  if depth>24 || result.count>=8000{return}
+  var output:CFArray?
+  guard AXUIElementCopyMultipleAttributeValues(e,keys,AXCopyMultipleAttributeOptions(rawValue:0),&output) == .success,let a=output as? [Any],a.count==7 else{return}
+  result.append(Node(element:e,role:a[0] as? String ?? "",value:a[1] as? String ?? "",title:a[2] as? String ?? "",description:a[3] as? String ?? "",placeholder:a[4] as? String ?? "",enabled:a[5] as? Bool ?? false))
+  let descendants:[AXUIElement]
+  if optimizeTableRows,a[0] as? String == kAXTableRole,let visible=attr(e,"AXVisibleRows") as? [AXUIElement],!visible.isEmpty {descendants=visible}
+  else {descendants=a[6] as? [AXUIElement] ?? []}
+  for child in descendants {visit(child,depth+1)}
+ }
+ visit(root,0);return result
+}
+guard AXIsProcessTrusted() else{finish("held","accessibility_permission_required")}
+if CommandLine.arguments.contains("--check"){finish("ready")}
+try FileManager.default.createDirectory(at:senderState,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
+let uiLock=open(senderState.appendingPathComponent("ui-send.lock").path,O_CREAT|O_RDWR,0o600)
+guard uiLock>=0,flock(uiLock,LOCK_EX|LOCK_NB)==0 else{finish("held","sender_busy")}
+let raw:Data
+if let key=requestKey {
+ guard key.range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil else{finish("held","invalid_request_key")}
+ guard let data=try? Data(contentsOf:senderState.appendingPathComponent("sender-requests/"+key+".json")) else{finish("held","missing_request")}
+ raw=data
+} else {raw=FileHandle.standardInput.readDataToEndOfFile()}
+guard let p=(try? JSONSerialization.jsonObject(with:raw)) as? [String:Any],let name=p["chat_name"] as? String,let trigger=p["trigger_body"] as? String,let reply=p["reply"] as? String,!name.isEmpty,!trigger.isEmpty,reply.hasPrefix("[System-유이] : "),reply.count<8192 else{finish("held","invalid_input")}
+stamp("input_read")
+func requireUnexpired(){
+ if let deadline=p["expires_at"] as? Double,Date().timeIntervalSince1970>deadline{finish(textSent ? "partial_file_held":(inputStarted ? "sending":"held"),"request_expired")}
+}
+requireUnexpired()
+if let session=CGSessionCopyCurrentDictionary() as? [String:Any],session["CGSSessionScreenIsLocked"] as? Bool == true {finish("held","screen_locked")}
+let apps=NSRunningApplication.runningApplications(withBundleIdentifier:"com.kakao.KakaoTalkMac")
+guard apps.count==1 else{finish("held","kakao_not_running_or_ambiguous")}
+let app=apps[0],root=AXUIElementCreateApplication(app.processIdentifier)
+func windowList()->[AXUIElement] {attr(root,kAXWindowsAttribute) as? [AXUIElement] ?? []}
+if p["probe"] as? Bool == true && p["inspect_windows"] as? Bool == true {
+ openTarget=["window_titles":windowList().map{str($0,kAXTitleAttribute)}]
+ finish("ready")
+}
+// Kakao advertises Cmd+2 for its chat list. Address only its process, never
+// the user's global keyboard, and verify the resulting main window.
+if !windowList().contains(where:{str($0,kAXTitleAttribute)=="카카오톡"}) {
+ _=app.activate(options:[])
+ if let down=CGEvent(keyboardEventSource:nil,virtualKey:19,keyDown:true),let up=CGEvent(keyboardEventSource:nil,virtualKey:19,keyDown:false){
+  down.flags = .maskCommand;up.flags = .maskCommand
+  down.postToPid(app.processIdentifier);Thread.sleep(forTimeInterval:0.03);up.postToPid(app.processIdentifier)
+ }
+ let deadline=Date().addingTimeInterval(1)
+ while Date()<deadline && !windowList().contains(where:{str($0,kAXTitleAttribute)=="카카오톡"}){Thread.sleep(forTimeInterval:0.05)}
+}
+func labelMatches(_ text:String,_ expected:String)->Bool {
+ let compact=text.split(whereSeparator:{$0.isWhitespace}).joined(separator:" ")
+ if compact==expected{return true}
+ let pattern="^"+NSRegularExpression.escapedPattern(for:expected)+"(?:\\s+\\d+)?\\s+(?:(?:오전|오후)\\s+\\d{1,2}:\\d{2}|\\d{1,2}월\\s+\\d{1,2}일|어제|오늘)(?:\\s+\\d+)?$"
+ return compact.range(of:pattern,options:.regularExpression) != nil
+}
+func findCandidates()->[(AXUIElement,[Node])] {
+ let wins=windowList(),named=wins.filter{str($0,kAXTitleAttribute)==name}
+ if named.count>1 {finish("held","duplicate_named_windows")}
+ let scope=(p["room_name_verified"] as? Bool == true) ? named : wins
+ var found:[(AXUIElement,[Node])]=[]
+ for window in scope {
+  let tree=collect(window)
+  if tree.contains(where:{$0.value==trigger}) && tree.contains(where:{$0.isComposer}) {found.append((window,tree))}
+ }
+ return found
+}
+func verifyListTarget(_ actualName:String){
+ let main=windowList().filter{str($0,kAXTitleAttribute)=="카카오톡"}
+ guard main.count==1 else{finish("held","chat_list_window_missing_or_ambiguous")}
+ let tables=collect(main[0]).filter{$0.role==kAXTableRole}
+ guard tables.count==1,let rows=attr(tables[0].element,"AXRows") as? [AXUIElement],!rows.isEmpty,rows.count<=10000 else{finish("held","complete_chat_rows_unavailable")}
+ if let count=attr(tables[0].element,"AXRowCount") as? Int,count>rows.count {finish("held","chat_rows_incomplete")}
+ let matching=rows.filter{row in collect(row).contains{node in node.role==kAXStaticTextRole && [node.value,node.title,node.description].contains{labelMatches($0,actualName)}}}
+ guard matching.count==1 else{finish("held","duplicate_or_missing_chat_name")}
+ if p["room_name_verified"] as? Bool != true {
+  let previews=rows.filter{row in collect(row).contains{node in node.role==kAXTextAreaRole && [node.value,node.title,node.description].contains(trigger)}}
+  guard previews.count==1,CFEqual(previews[0],matching[0]) else{finish("held","unknown_room_preview_ambiguous_or_changed")}
+ }
+}
+if p["probe"] as? Bool == true && p["close_probe"] as? Bool == true {
+ let target=windowList().filter{str($0,kAXTitleAttribute)==name}
+ guard target.count==1 else{finish("held","close_probe_target_ambiguous")}
+ let editors=collect(target[0]).filter{$0.isComposer}
+ guard editors.count==1 && editors[0].value.isEmpty else{finish("held","close_probe_draft_present")}
+ guard let button=attr(target[0],kAXCloseButtonAttribute),CFGetTypeID(button)==AXUIElementGetTypeID() else{finish("held","close_probe_button_missing")}
+ _=AXUIElementPerformAction(button as! AXUIElement,kAXPressAction as CFString)
+ let deadline=Date().addingTimeInterval(2)
+ while Date()<deadline {
+  if !windowList().contains(where:{str($0,kAXTitleAttribute)==name}){finish("ready","target_closed_verified")}
+  Thread.sleep(forTimeInterval:0.05)
+ }
+ finish("held","close_probe_not_verified")
+}
+var candidates=findCandidates()
+if candidates.isEmpty {
+ let main=windowList().filter{str($0,kAXTitleAttribute)=="카카오톡"}
+ guard main.count==1 else{finish("held","chat_list_window_missing_or_ambiguous")}
+ let rows=collect(main[0]).filter{$0.role==kAXRowRole}
+ let matching=rows.filter{row in
+  let content=collect(row.element)
+  if p["room_name_verified"] as? Bool == true {
+   return content.contains{node in
+    node.role==kAXStaticTextRole && [node.value,node.title,node.description].contains{labelMatches($0,name)}
+   }
+  }
+  return content.contains{node in
+   node.role==kAXTextAreaRole && [node.value,node.title,node.description].contains(trigger)
+  }
+ }
+ guard matching.count==1 else{finish("held","chat_list_target_missing_or_ambiguous")}
+ let row=matching[0].element
+ let tables=collect(main[0]).filter{$0.role==kAXTableRole}
+ guard tables.count==1 else{finish("held","chat_list_table_ambiguous")}
+ let table=tables[0].element
+ guard AXUIElementSetAttributeValue(table,"AXSelectedRows" as CFString,[row] as CFArray) == .success else{finish("held","chat_row_selection_failed")}
+ guard let selected=attr(table,"AXSelectedRows") as? [AXUIElement],selected.count==1,CFEqual(selected[0],row) else{finish("held","chat_row_selection_not_verified")}
+ _=AXUIElementSetAttributeValue(table,kAXFocusedAttribute as CFString,kCFBooleanTrue)
+ func actions(_ element:AXUIElement)->[String] {
+  var names:CFArray?;guard AXUIElementCopyActionNames(element,&names) == .success else{return []}
+  return names as? [String] ?? []
+ }
+ let rowActions=actions(row),tableActions=actions(table)
+ let opened:AXError
+ if rowActions.contains(kAXPressAction) {opened=AXUIElementPerformAction(row,kAXPressAction as CFString)}
+ else if rowActions.contains("AXConfirm") {opened=AXUIElementPerformAction(row,"AXConfirm" as CFString)}
+ else if tableActions.contains("AXConfirm") {opened=AXUIElementPerformAction(table,"AXConfirm" as CFString)}
+ else{
+  // AX supplies and rechecks the target for a pointer-free open;
+  // no screenshot, external desktop server or untrusted command is involved.
+  _=app.activate(options:[])
+  guard AXUIElementPerformAction(main[0],kAXRaiseAction as CFString) == .success else{finish("held","chat_list_raise_failed")}
+  _=AXUIElementSetAttributeValue(main[0],kAXMainAttribute as CFString,kCFBooleanTrue)
+  let focusDeadline=Date().addingTimeInterval(1)
+  while Date()<focusDeadline {
+   if let focused=attr(root,kAXFocusedWindowAttribute),CFGetTypeID(focused)==AXUIElementGetTypeID(),CFEqual(focused,main[0]),NSWorkspace.shared.frontmostApplication?.processIdentifier==app.processIdentifier {break}
+   Thread.sleep(forTimeInterval:0.03)
+  }
+  guard let focused=attr(root,kAXFocusedWindowAttribute),CFGetTypeID(focused)==AXUIElementGetTypeID(),CFEqual(focused,main[0]),NSWorkspace.shared.frontmostApplication?.processIdentifier==app.processIdentifier else{finish("held","chat_list_focus_not_verified")}
+  // AX focus can precede the WindowServer's completed front-window transition.
+  Thread.sleep(forTimeInterval:0.2)
+  guard let selectedNow=attr(table,"AXSelectedRows") as? [AXUIElement],selectedNow.count==1,CFEqual(selectedNow[0],row) else{finish("held","chat_row_selection_changed")}
+  let freshRow=collect(row)
+  let stillMatches=freshRow.contains{node in
+   if p["room_name_verified"] as? Bool == true {return node.role==kAXStaticTextRole && [node.value,node.title,node.description].contains{labelMatches($0,name)}}
+   return node.role==kAXTextAreaRole && [node.value,node.title,node.description].contains(trigger)
+  }
+  guard stillMatches else{finish("held","chat_row_content_changed")}
+  // Open only via a key addressed to Kakao's verified chat-list focus.
+  // Never post mouse events or send a global keyboard event.
+  guard AXUIElementSetAttributeValue(table,kAXFocusedAttribute as CFString,kCFBooleanTrue) == .success,
+        let focusedElement=attr(root,kAXFocusedUIElementAttribute),CFGetTypeID(focusedElement)==AXUIElementGetTypeID(),
+        (CFEqual(focusedElement,table) || freshRow.contains(where:{CFEqual($0.element,focusedElement)})) else{finish("held","chat_list_keyboard_focus_not_verified")}
+  let pointerBefore=CGEvent(source:nil)?.location
+  guard let down=CGEvent(keyboardEventSource:nil,virtualKey:36,keyDown:true),let up=CGEvent(keyboardEventSource:nil,virtualKey:36,keyDown:false) else{finish("held","keyboard_event_creation_failed")}
+  down.postToPid(app.processIdentifier);Thread.sleep(forTimeInterval:0.03);up.postToPid(app.processIdentifier)
+  stamp("scoped_keyboard_open_completed")
+  let pointerAfter=CGEvent(source:nil)?.location
+  openTarget=["transport":"pid_keyboard","mouse_events_posted":false,"pointer_same_at_observation":pointerBefore==pointerAfter]
+  opened = .success
+ }
+ guard opened == .success else{finish("held","chat_row_open_action_failed")}
+ let deadline=Date().addingTimeInterval(4)
+ while Date()<deadline {
+  candidates=findCandidates()
+  if !candidates.isEmpty{break}
+  Thread.sleep(forTimeInterval:0.1)
+ }
+ stamp("chat_opened")
+}
+guard candidates.count==1 else{finish("held","trigger_chat_window_missing_or_ambiguous")}
+let (win,nodes)=candidates[0]
+let actualName=str(win,kAXTitleAttribute)
+guard !actualName.isEmpty else{finish("held","missing_actual_chat_name")}
+resolvedChatName=actualName
+verifyListTarget(actualName)
+stamp("target_verified")
+if p["probe"] as? Bool == true {finish("ready")}
+let editors=nodes.filter{$0.isComposer}
+guard editors.count==1 else{finish("held","composer_ambiguous")}
+let editor=editors[0].element
+let originalDraft=str(editor,kAXValueAttribute)
+let before=nodes.filter{$0.value==reply && !$0.isComposer}.count
+var backupURL:URL?=nil
+if !originalDraft.isEmpty {
+ let dir=senderState.appendingPathComponent("draft-backups")
+ do {
+  try FileManager.default.createDirectory(at:dir,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
+  let url=dir.appendingPathComponent((requestKey ?? UUID().uuidString)+".json")
+  try JSONSerialization.data(withJSONObject:["chat_name":actualName,"draft":originalDraft,"captured_at":Date().timeIntervalSince1970]).write(to:url,options:.atomic)
+  try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:url.path)
+  backupURL=url
+ } catch {finish("held","draft_backup_failed")}
+}
+func restoreDraft(){
+ // Never replace text typed by the owner while delivery was being verified.
+ if str(win,kAXTitleAttribute)==actualName && str(editor,kAXValueAttribute).isEmpty {
+  if originalDraft.isEmpty {draftRestored=true}
+  else if AXUIElementSetAttributeValue(editor,kAXValueAttribute as CFString,originalDraft as CFString) == .success && str(editor,kAXValueAttribute)==originalDraft {draftRestored=true}
+ }
+ if draftRestored,let url=backupURL {try? FileManager.default.removeItem(at:url)}
+}
+func performAttachment(_ path:String){
+ requireUnexpired()
+ let file=URL(fileURLWithPath:path).standardizedFileURL.resolvingSymlinksInPath()
+ let allowed=senderState.appendingPathComponent("file-jobs").standardizedFileURL.path+"/"
+ guard file.path.hasPrefix(allowed),file.pathExtension.lowercased()=="zip",FileManager.default.fileExists(atPath:file.path) else{finish("partial_file_held","invalid_attachment_path")}
+ if let session=CGSessionCopyCurrentDictionary() as? [String:Any],session["CGSSessionScreenIsLocked"] as? Bool == true {finish("partial_file_held","screen_locked")}
+ guard str(win,kAXTitleAttribute)==actualName,str(editor,kAXValueAttribute)==originalDraft else{finish("partial_file_held","composer_changed_before_attachment")}
+ func completeFiles()->Int {
+  collect(win).filter{node in
+   let text=node.value+node.title+node.description
+   return node.role==kAXStaticTextRole && text.contains(file.lastPathComponent) && text.contains("유효기간")
+  }.count
+ }
+ let beforeFiles=completeFiles()
+ let clipboard=NSPasteboard.general
+ let saved=clipboard.pasteboardItems?.map{item in
+  item.types.reduce(into:[NSPasteboard.PasteboardType:Data]()){result,type in
+   if let data=item.data(forType:type){result[type]=data}
+  }
+ } ?? []
+ clipboard.clearContents()
+ guard clipboard.writeObjects([file as NSURL]) else{finish("partial_file_held","file_clipboard_failed")}
+ let ownClipboardVersion=clipboard.changeCount
+ cleanupClipboard = {
+  if clipboard.changeCount==ownClipboardVersion {
+   clipboard.clearContents()
+   let items=saved.map{values -> NSPasteboardItem in
+    let item=NSPasteboardItem();for (type,data) in values{item.setData(data,forType:type)};return item
+   }
+   clipboard.writeObjects(items)
+  }
+ }
+ defer {cleanupClipboard?();cleanupClipboard=nil}
+ _=AXUIElementPerformAction(win,kAXRaiseAction as CFString)
+ _=app.activate(options:[])
+ _=AXUIElementSetAttributeValue(editor,kAXFocusedAttribute as CFString,kCFBooleanTrue)
+ guard let focused=attr(root,kAXFocusedUIElementAttribute),CFEqual(focused,editor),str(win,kAXTitleAttribute)==actualName else{finish("partial_file_held","attachment_focus_not_verified")}
+ guard let down=CGEvent(keyboardEventSource:nil,virtualKey:9,keyDown:true),let up=CGEvent(keyboardEventSource:nil,virtualKey:9,keyDown:false) else{finish("partial_file_held","attachment_key_creation_failed")}
+ down.flags = .maskCommand;up.flags = .maskCommand
+ down.postToPid(app.processIdentifier);up.postToPid(app.processIdentifier)
+ let previewDeadline=Date().addingTimeInterval(8)
+ var uploadButton:AXUIElement?=nil
+ while Date()<previewDeadline {
+  Thread.sleep(forTimeInterval:0.1)
+  let sheets=attr(win,"AXSheets") as? [AXUIElement] ?? []
+  let sheetNodes:[Node]=sheets.flatMap{collect($0)}
+  let nodes:[Node]=sheetNodes.isEmpty ? collect(win) : sheetNodes
+  if nodes.contains(where:{($0.value+$0.title+$0.description).contains(file.lastPathComponent)}) {
+   let sends=nodes.filter{node in
+    let uploadTitle=(node.title=="1개 전송" || node.description=="1개 전송")
+    return node.role==kAXButtonRole && uploadTitle && node.enabled
+   }
+   if sends.count==1 {uploadButton=sends[0].element;break}
+  }
+ }
+ guard let upload=uploadButton,str(win,kAXTitleAttribute)==actualName else{finish("partial_file_held","attachment_preview_not_verified")}
+ stamp("before_attachment_send")
+ requireUnexpired()
+ _=AXUIElementPerformAction(upload,kAXPressAction as CFString)
+ let deadline=Date().addingTimeInterval(35)
+ while Date()<deadline {
+  Thread.sleep(forTimeInterval:0.15)
+  if str(win,kAXTitleAttribute)==actualName && completeFiles()>beforeFiles {
+   attachmentSent=true;stamp("attachment_verified");return
+  }
+ }
+ finish("sending","attachment_delivery_not_observed")
+}
+guard str(win,kAXTitleAttribute)==actualName,str(editor,kAXValueAttribute)==originalDraft else{finish("held","composer_changed_before_write")}
+requireUnexpired()
+stamp("before_input")
+inputStarted=true
+guard AXUIElementSetAttributeValue(editor,kAXValueAttribute as CFString,reply as CFString) == .success else{finish("sending","composer_write_outcome_uncertain")}
+guard str(win,kAXTitleAttribute)==actualName,str(editor,kAXValueAttribute)==reply else{finish("sending","composer_changed_after_write")}
+let sendButtons=nodes.filter{$0.isSend}
+guard sendButtons.count==1 else{finish("sending","send_button_ambiguous_after_input")}
+let button=sendButtons[0].element
+var ready=false
+for _ in 0..<10 {
+ if attr(button,kAXEnabledAttribute) as? Bool == true {ready=true;break}
+ Thread.sleep(forTimeInterval:0.05)
+}
+guard ready,str(editor,kAXValueAttribute)==reply else{finish("sending","composer_or_send_button_changed")}
+stamp("before_send")
+requireUnexpired()
+let pressed=AXUIElementPerformAction(button,kAXPressAction as CFString)
+for _ in 0..<20 {
+ Thread.sleep(forTimeInterval:0.1)
+ if str(win,kAXTitleAttribute)==actualName && str(editor,kAXValueAttribute).isEmpty {
+  if collect(win).filter({$0.value==reply && !$0.isComposer}).count>before {
+   textSent=true;stamp("sent_verified");restoreDraft()
+   if let path=p["attachment_path"] as? String {performAttachment(path)}
+   finish("sent_verified",draftRestored ? "":"draft_saved_for_recovery")
+  }
+ }
+}
+finish("sending",pressed == .success ? "delivery_not_observed":"press_outcome_uncertain")

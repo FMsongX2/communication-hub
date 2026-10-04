@@ -1,0 +1,13 @@
+/target/
+/local/
+*.sqlite3*
+*.sock
+*.log
+.DS_Store
+.state/
+build/
+*.app/
+*.dSYM/
+.env*
+*.zip
+/runtime/

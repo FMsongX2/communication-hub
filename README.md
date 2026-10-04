@@ -1,0 +1,91 @@
+# Communication Hub
+
+[English](README.md) | [한국어](README_ko.md)
+
+A local Rust service for routing communication and work requests through one hub. **KakaoTalk is the first implemented adapter. Discord, Slack, and Notion are planned, not connected.** Notion is treated as a document/comment workspace rather than another chat window.
+
+**Status: experimental alpha.** Text delivery has been exercised on a real macOS installation; automated native attachment upload still needs end-to-end validation. Automation is disabled in fresh installations.
+
+```mermaid
+flowchart LR
+    K[KakaoTalk adapter] --> E[Normalized event]
+    F[Future adapters] -.-> E
+    E --> Q[Durable SQLite queue]
+    Q --> W[Worker and policy]
+    W --> M[Local model backend]
+    M --> P[Reply or approved bundle plan]
+    P --> A[Destination adapter]
+    A --> R[Verified, held or uncertain receipt]
+```
+
+## What it does
+
+- Separates sessions and event IDs by **provider, account, and conversation**.
+- Persists incoming work before model execution; ingestion can continue while the worker waits.
+- Journals delivery attempts and quarantines uncertain work after restart. It does not promise exactly-once delivery across an external UI.
+- Reloads the configured Contact-Other policy before each model invocation and external write.
+- Uses a compatible local Codex App Server over WebSocket/JSON-RPC on a Unix socket. Model and reasoning effort are configurable.
+- Provides `status`, `adapters`, `pause`, and `resume` through a same-user local control socket. Pause survives restart.
+- Builds approved JSON + ZIP bundles with path, size, CRC, and basic sensitive-content checks.
+- Uses Swift helpers for macOS permissions and Accessibility. The runtime requires neither Python nor Orca.
+
+The current worker is serial. This is an adapter foundation, not a ready-made universal integration or dynamic plugin loader.
+
+## macOS setup
+
+Requirements: Rust/Cargo, Xcode Command Line Tools (`swiftc`), `jq`, logged-in KakaoTalk, and a compatible running Codex App Server with a model your account supports. Rust unit tests also run on Linux; the KakaoTalk helpers are macOS-only.
+
+```sh
+git clone https://github.com/FMsongX2/communication-hub.git
+cd communication-hub
+./scripts/setup-macos.sh --model YOUR_SUPPORTED_MODEL_ID
+```
+
+The script builds the Rust binary and two locally signed helper apps. It creates a private configuration under `~/Library/Application Support/CommunicationHub` and refuses to overwrite an existing configuration. **It does not start a service, enable an adapter, send a message, or grant macOS permissions.**
+
+1. Review the generated `config.json` and `contact-other.md`. Set the backend socket, account alias, supported model, and an existing approved project working directory.
+2. Grant **Full Disk Access to Kakao Mention Receiver** and **Accessibility to Kakao Reply Sender** in macOS settings. These are broad OS grants even though the helpers limit their operations to KakaoTalk.
+3. Set `kakao.enabled=true`. Enable `dispatch_enabled` and `external_auto_send` only after reviewing policy and recipients. Both start as `false`.
+4. Run the hub in the foreground first:
+
+```sh
+"$HOME/Library/Application Support/CommunicationHub/bin/communication-hub" run
+```
+
+See [operations](docs/operations.md) for a user LaunchAgent, upgrades, and rollback. The hub belongs in the logged-in user's session, not a root system daemon. A compatible local backend can be a desktop-managed server or a user-started App Server; this repository does not extract credentials or create backend accounts.
+
+## CLI and calls
+
+```sh
+communication-hub status
+communication-hub adapters
+communication-hub pause
+communication-hub resume
+```
+
+Use the installed binary's full path or add its `bin` directory to your PATH. A first KakaoTalk call uses `@[유이]`; initialized conversations accept both `@[유이]` and `[유이]`. Untagged messages do not invoke the model.
+
+When sending, the helper rechecks the conversation and trigger, rejects ambiguous names, preserves an existing draft, and verifies a new outgoing bubble. It does not move or click the mouse pointer. It can temporarily bring KakaoTalk forward and send a key to that process. Locked sessions, unavailable Accessibility rows, or ambiguous targets are held.
+
+## Boundaries and limitations
+
+- Accessibility scans can be slow on large histories. Notification polling is currently three seconds. Focused/muted rooms, disabled previews, and some self-messages may produce no usable notification. No notification means no call.
+- UI titles and rendered content are not a cryptographic room-ID binding. The helper fails closed when the accessible list or target is ambiguous; renamed, virtualized, or localized UI can still prevent delivery.
+- Same-UID local processes are trusted control clients. File permissions do not isolate hostile software running as the owner.
+- Read-only model execution prevents ordinary writes; it is not complete read isolation. Policy text and sensitive-content heuristics are not a comprehensive data-loss prevention system.
+- Only configured conversation-specific bundles may be selected. Native attachment upload remains experimental. No credentials, private graph, owner profile, actual conversation, database, or personal dataset is distributed.
+- The account identifier is a configured alias; it is not automatically authenticated from KakaoTalk. After switching accounts, change scope and inspect cached routes before enabling replies.
+
+## Development and review
+
+```sh
+cargo fmt --check
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo audit
+./scripts/build-native.sh /tmp/communication-hub-native
+```
+
+Contract tests cover isolation, duplicate intake, restart quarantine, policy reload, mixed RPC notifications, final-answer selection, quota classification, ZIP boundaries, concurrent atomic writes, and retryable storage failure. CI checks Rust on Linux/macOS and compiles native helpers on macOS. See [release review](docs/REVIEW.md) and [adapter extension guide](docs/adapters.md).
+
+MIT licensed. OpenKakao-derived notification and AX selection conventions retain their [MIT attribution](third_party/openkakao/NOTICE.md). Protocol reference: [official Codex App Server documentation](https://learn.chatgpt.com/docs/app-server).
