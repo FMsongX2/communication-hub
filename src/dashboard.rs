@@ -106,6 +106,9 @@ pub fn router(board: Board) -> Router {
         .route("/api/calls", get(calls))
         .route("/api/rooms", get(rooms).post(update_room))
         .route("/api/rooms/verify", post(verify_room))
+        .route("/api/rooms/available", get(available_rooms))
+        .route("/api/rooms/add", post(add_room))
+        .route("/api/rooms/remove", post(remove_room))
         .route("/api/settings", post(update_settings))
         .route_layer(middleware::from_fn_with_state(board.clone(), auth));
     Router::new()
@@ -226,6 +229,56 @@ async fn verify_room(
         .await
         .map(Json)
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+/// The chat list's room names, read through the sender on the owner's request only.
+async fn available_rooms(State(b): State<Board>) -> Result<Json<Value>, StatusCode> {
+    crate::adapters::Kakao {
+        cfg: (*b.cfg).clone(),
+    }
+    .list_rooms(&b.store)
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+#[derive(Deserialize)]
+pub struct RoomAdd {
+    pub title: String,
+    pub yui: bool,
+    pub yumi: bool,
+}
+/// Adds a room by name once the chat list proves the name unique.
+async fn add_room(
+    State(b): State<Board>,
+    Json(a): Json<RoomAdd>,
+) -> Result<Json<Value>, StatusCode> {
+    let receipt = crate::adapters::Kakao {
+        cfg: (*b.cfg).clone(),
+    }
+    .verify_name(&a.title)
+    .await
+    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let Some(rows) = receipt["list_rows"]
+        .as_i64()
+        .filter(|_| receipt["status"] == "ready")
+    else {
+        return Ok(Json(
+            json!({"added":false,"status":receipt["status"],"reason":receipt["reason"]}),
+        ));
+    };
+    b.store
+        .add_room_by_name("kakao", &b.cfg.kakao.account, &a.title, a.yui, a.yumi, rows)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    Ok(Json(json!({"added":true,"list_rows":rows})))
+}
+async fn remove_room(
+    State(b): State<Board>,
+    Json(r): Json<RoomKey>,
+) -> Result<Json<Value>, StatusCode> {
+    match b.store.remove_room(&r.key) {
+        Ok(true) => Ok(Json(json!({"removed":true}))),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 #[derive(Deserialize)]
 pub struct Settings {

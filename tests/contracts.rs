@@ -1467,3 +1467,34 @@ fn rooms_in_use_before_the_registry_start_approved_and_verification_is_recorded(
     );
     assert_eq!(s.room(&e.conversation).unwrap().unwrap()["approved"], false);
 }
+#[test]
+fn rooms_added_by_name_bind_on_first_call_and_removal_returns_them_to_pending() {
+    let t = TempDir::new().unwrap();
+    let s = Store::open(t.path().join("state")).unwrap();
+    let e = event();
+    s.add_room_by_name("kakao", "owner", "fixture", true, false, 186)
+        .unwrap();
+    let rooms = s.rooms().unwrap();
+    assert_eq!(rooms[0]["conversation_id"], "name:fixture");
+    assert_eq!(rooms[0]["approved"], true);
+    assert!(s.room(&e.conversation).unwrap().is_none());
+    // The first notification from a room with that title binds the registration to its real ID.
+    s.note_room_seen(&e.conversation, "fixture").unwrap();
+    let room = s.room(&e.conversation).unwrap().unwrap();
+    assert_eq!(room["approved"], true);
+    assert_eq!(room["yumi"], false);
+    assert_eq!(room["verified_rows"], 186);
+    assert_eq!(s.rooms().unwrap().len(), 1);
+    // Removed rooms come back unapproved on their next call.
+    assert!(s.remove_room(&e.conversation.key()).unwrap());
+    s.note_room_seen(&e.conversation, "fixture").unwrap();
+    assert_eq!(s.room(&e.conversation).unwrap().unwrap()["approved"], false);
+    // Adding a name that is already known under its real ID approves it in place.
+    s.add_room_by_name("kakao", "owner", "fixture", true, true, 190)
+        .unwrap();
+    let rooms = s.rooms().unwrap();
+    assert_eq!(rooms.len(), 1);
+    assert_eq!(rooms[0]["conversation_id"], "room1");
+    assert_eq!(rooms[0]["approved"], true);
+    assert_eq!(rooms[0]["verified_rows"], 190);
+}

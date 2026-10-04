@@ -111,8 +111,59 @@ impl Store {
         ).optional()?)
     }
     pub fn note_room_seen(&self, c: &Conversation, title: &str) -> Result<()> {
-        self.db()?.execute("INSERT INTO rooms(conversation,title,seen) VALUES(?,?,?) ON CONFLICT(conversation) DO UPDATE SET seen=excluded.seen",params![c.key(),title,now()])?;
+        let db = self.db()?;
+        // A room the owner added by name binds to the real room ID on its first call.
+        if !title.is_empty() {
+            db.execute(
+                "UPDATE rooms SET conversation=?1 WHERE conversation=?2 AND NOT EXISTS(SELECT 1 FROM rooms WHERE conversation=?1)",
+                params![c.key(), Self::named(c, title).key()],
+            )?;
+        }
+        db.execute("INSERT INTO rooms(conversation,title,seen) VALUES(?,?,?) ON CONFLICT(conversation) DO UPDATE SET seen=excluded.seen",params![c.key(),title,now()])?;
         Ok(())
+    }
+    /// The placeholder identity of a room added by name before its first call reveals its ID.
+    pub fn named(c: &Conversation, title: &str) -> Conversation {
+        Conversation {
+            provider: c.provider.clone(),
+            account: c.account.clone(),
+            id: format!("name:{title}"),
+        }
+    }
+    /// Registers an approved room by its verified chat-list name.
+    pub fn add_room_by_name(
+        &self,
+        provider: &str,
+        account: &str,
+        title: &str,
+        yui: bool,
+        yumi: bool,
+        verified_rows: i64,
+    ) -> Result<()> {
+        let template = Conversation {
+            provider: provider.into(),
+            account: account.into(),
+            id: String::new(),
+        };
+        let db = self.db()?;
+        // A room already known under its real ID is approved in place instead.
+        let updated = db.execute(
+            "UPDATE rooms SET approved=COALESCE(approved,?1),yui=?2,yumi=?3,verified_rows=?4,verified_at=?1 WHERE title=?5 AND conversation NOT LIKE '%\"name:%'",
+            params![now(), yui, yumi, verified_rows, title],
+        )?;
+        if updated == 0 {
+            db.execute(
+                "INSERT INTO rooms(conversation,title,approved,yui,yumi,verified_rows,verified_at,seen) VALUES(?1,?2,?3,?4,?5,?6,?3,?3) ON CONFLICT(conversation) DO UPDATE SET approved=excluded.approved,yui=excluded.yui,yumi=excluded.yumi,verified_rows=excluded.verified_rows,verified_at=excluded.verified_at",
+                params![Self::named(&template, title).key(), title, now(), yui, yumi, verified_rows],
+            )?;
+        }
+        Ok(())
+    }
+    pub fn remove_room(&self, key: &str) -> Result<bool> {
+        Ok(self
+            .db()?
+            .execute("DELETE FROM rooms WHERE conversation=?", [key])?
+            == 1)
     }
     /// Approval, per-sister switches and an optional title correction from the dashboard.
     pub fn update_room(&self, key: &str, approved: bool, yui: bool, yumi: bool) -> Result<bool> {

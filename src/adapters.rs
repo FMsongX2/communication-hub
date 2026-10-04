@@ -146,6 +146,56 @@ impl Kakao {
         }
         Ok(receipt)
     }
+    /// Proves from the chat list alone that exactly one room carries `title`.
+    pub async fn verify_name(&self, title: &str) -> Result<Value> {
+        if title.is_empty() || title.chars().count() > 200 {
+            return Ok(json!({"status":"held","reason":"missing_target"}));
+        }
+        self.native_request(
+            &json!({"chat_name":title,"room_name_verified":true,"trigger_body":"room-verification",
+            "reply":crate::event::PREFIX,"verify_room":true,"expires_at":crate::event::now()+75.0}),
+        )
+        .await
+    }
+    /// Reads the chat list's room names for the dashboard picker; names shared by several rooms
+    /// are flagged because they cannot be addressed safely.
+    pub async fn list_rooms(&self, store: &Store) -> Result<Value> {
+        let receipt = self
+            .native_request(&json!({"chat_name":"room-list","trigger_body":"room-list",
+                "reply":crate::event::PREFIX,"list_rooms":true,"expires_at":crate::event::now()+75.0}))
+            .await?;
+        if receipt["status"] != "ready" {
+            return Ok(json!({"status":receipt["status"],"reason":receipt["reason"],"rooms":[]}));
+        }
+        let names: Vec<String> = receipt["rooms"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| r["name"].as_str().map(str::to_owned))
+                    .filter(|n| !n.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let registered: std::collections::HashSet<String> = store
+            .rooms()?
+            .into_iter()
+            .filter(|r| r["approved"] == true)
+            .filter_map(|r| r["title"].as_str().map(str::to_owned))
+            .collect();
+        let mut counts = std::collections::HashMap::new();
+        for n in &names {
+            *counts.entry(n.clone()).or_insert(0) += 1;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let rooms: Vec<Value> = names
+            .into_iter()
+            .filter(|n| seen.insert(n.clone()))
+            .map(
+                |n| json!({"name":n,"duplicate":counts[&n]>1,"registered":registered.contains(&n)}),
+            )
+            .collect();
+        Ok(json!({"status":"ready","rooms":rooms,"list_rows":receipt["list_rows"]}))
+    }
     /// Dashboard registration: proves the room name is unique in the chat list without opening the
     /// room or writing anything, and records the list size it held at.
     pub async fn verify_room(&self, store: &Store, key: &str) -> Result<Value> {
@@ -154,13 +204,8 @@ impl Kakao {
             .into_iter()
             .find(|r| r["key"] == key)
             .ok_or_else(|| anyhow::anyhow!("unknown_room"))?;
-        let title = room["title"].as_str().unwrap_or("");
-        if title.is_empty() {
-            return Ok(json!({"status":"held","reason":"missing_target"}));
-        }
         let receipt = self
-            .native_request(&json!({"chat_name":title,"room_name_verified":true,"trigger_body":"room-verification",
-                "reply":crate::event::PREFIX,"verify_room":true,"expires_at":crate::event::now()+75.0}))
+            .verify_name(room["title"].as_str().unwrap_or(""))
             .await?;
         if receipt["status"] == "ready"
             && let Some(rows) = receipt["list_rows"].as_i64()

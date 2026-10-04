@@ -47,7 +47,7 @@ function drawRooms(d){
  if(!d.rooms.length){const row=elem('tr');const cell=elem('td','empty','아직 호출된 방이 없어요. 처음 부르면 여기 승인 대기로 올라와요.');cell.colSpan=7;row.append(cell);tbody.append(row);}
  for(const r of d.rooms){
   const row=elem('tr',r.approved?'':'row-pending');
-  const where=elem('td');where.append(elem('div','primary',r.title||'방 이름 없음'),elem('div','secondary',`${providerNames[r.provider]||r.provider} · ${r.account}`),elem('div','secondary mono',r.conversation_id));
+  const where=elem('td');where.append(elem('div','primary',r.title||'방 이름 없음'),elem('div','secondary',`${providerNames[r.provider]||r.provider} · ${r.account}`),elem('div','secondary mono',r.conversation_id.startsWith('name:')?'이름으로 추가됨 · 첫 호출 때 방 ID 연결':r.conversation_id));
   const state=elem('td');state.append(badge(r.approved?'승인됨':'승인 대기',r.approved?'online':'held'));
   const toggle=(field,enabled)=>{const cell=elem('td');const box=document.createElement('input');box.type='checkbox';box.checked=r[field];box.disabled=!enabled;box.setAttribute('aria-label',`${r.title} ${field==='yui'?'유이':'유미'}`);box.addEventListener('change',()=>save(r,{[field]:box.checked}));cell.append(box);return cell;};
   const verified=elem('td');verified.append(elem('div',null,r.verified_rows?`목록 ${r.verified_rows}개에서 하나뿐`:'검증 전'),elem('div','secondary',r.verified_at?relative(r.verified_at):'방 이름 검증 필요'));
@@ -55,12 +55,26 @@ function drawRooms(d){
   const actions=elem('td');const box=elem('div','actions');
   const approve=elem('button','button',r.approved?'승인 해제':'승인');approve.addEventListener('click',()=>save(r,{approved:!r.approved}));
   const verify=elem('button','button','이름 검증');verify.addEventListener('click',()=>verifyRoom(r,verify));
-  box.append(approve,verify);actions.append(box);
+  const remove=elem('button','button','제거');remove.addEventListener('click',()=>removeRoom(r));
+  box.append(approve,verify,remove);actions.append(box);
   row.append(where,state,toggle('yui',true),toggle('yumi',d.yumi_configured),verified,last,actions);tbody.append(row);
  }
 }
 async function save(r,change){try{await post('/api/rooms',{key:r.key,approved:r.approved,yui:r.yui,yumi:r.yumi,...change});await refresh();}catch(e){value('error-notice',e.message);$('error-notice').classList.remove('hidden');}}
 async function verifyRoom(r,button){button.disabled=true;button.textContent='검증 중…';try{const res=await post('/api/rooms/verify',{key:r.key});const ok=res.status==='ready';value('error-notice',ok?`“${r.title}” 방 이름이 목록 ${res.list_rows}개 중 하나뿐인 걸 확인했어요.`:`“${r.title}” 검증 보류: ${res.reason||res.status}`);$('error-notice').classList.toggle('error',!ok);$('error-notice').classList.remove('hidden');await refresh();}catch(e){value('error-notice',e.message);$('error-notice').classList.remove('hidden');}finally{button.disabled=false;button.textContent='이름 검증';}}
+async function removeRoom(r){if(!confirm(`“${r.title}” 방을 목록에서 제거할까요? 이 방에서 다시 부르면 승인 대기로만 올라와요.`))return;try{await post('/api/rooms/remove',{key:r.key});await refresh();}catch(e){value('error-notice',e.message);$('error-notice').classList.remove('hidden');}}
+let availableRooms=[];
+function drawAvailable(){
+ const q=$('room-search').value.toLocaleLowerCase();const tbody=$('available-rooms');tbody.replaceChildren();
+ for(const a of availableRooms.filter(a=>!q||a.name.toLocaleLowerCase().includes(q))){
+  const row=elem('tr');const name=elem('td');name.append(elem('div','primary',a.name));
+  const state=elem('td');if(a.registered)state.append(badge('추가됨','online'));else if(a.duplicate)state.append(badge('이름 중복','held'));
+  const act=elem('td');const add=elem('button','button','추가');add.disabled=a.registered||a.duplicate;add.addEventListener('click',()=>addRoom(a,add));act.append(add);
+  row.append(name,state,act);tbody.append(row);
+ }
+}
+async function loadAvailable(){const b=$('load-rooms');b.disabled=true;value('add-room-status','카톡 채팅 목록을 읽는 중이에요… (10초쯤 걸려요)');try{const d=await api('/api/rooms/available');if(d.status!=='ready'){value('add-room-status',`목록을 읽지 못했어요: ${d.reason||d.status}`);return;}availableRooms=d.rooms;value('add-room-status',`방 ${d.rooms.length}개 · 이름이 겹치는 방 ${d.rooms.filter(r=>r.duplicate).length}개`);drawAvailable();}catch(e){value('add-room-status',e.message);}finally{b.disabled=false;}}
+async function addRoom(a,button){button.disabled=true;button.textContent='검증 중…';try{const r=await post('/api/rooms/add',{title:a.name,yui:true,yumi:!!roomsData?.yumi_configured});if(r.added){a.registered=true;value('add-room-status',`“${a.name}” 방을 추가했어요. 첫 호출 때 방 ID가 연결돼요.`);}else{value('add-room-status',`“${a.name}” 추가 보류: ${r.reason||r.status}`);}drawAvailable();await refresh();}catch(e){value('add-room-status',e.message);}finally{button.textContent='추가';button.disabled=a.registered||a.duplicate;}}
 function lookup(key){return snapshot?.bindings.find(b=>b.key===key);}
 function place(key){const b=lookup(key);if(b)return b;try{const p=JSON.parse(key);if(Array.isArray(p)&&p.length===3)return {provider:p[0],account:p[1],conversation_id:p[2],title:'세션 생성 전 연결'};}catch{}return null;}
 function drawCalls(){
@@ -97,8 +111,8 @@ async function refresh(full=true){
  catch(e){$('connection').className='badge offline';value('connection','연결 끊김');value('hub-value','연결 끊김');value('source-value','확인 불가');value('backend-value','확인 불가');value('error-notice',e.message+(lastGood?' 마지막 갱신 '+new Date(lastGood).toLocaleTimeString('ko-KR',{hour12:false}):''));$('error-notice').classList.remove('hidden');}
  finally{refreshing=false;$('refresh').disabled=false;}
 }
-$('refresh').addEventListener('click',()=>refresh());$('answer-unapproved').addEventListener('change',async e=>{try{await post('/api/settings',{answer_unapproved_rooms:e.target.checked});await refresh();}catch(err){value('error-notice',err.message);$('error-notice').classList.remove('hidden');}});$('search').addEventListener('input',drawCalls);$('status-filter').addEventListener('change',drawCalls);
+$('refresh').addEventListener('click',()=>refresh());$('open-add-room').addEventListener('click',()=>$('add-room').showModal());$('close-add-room').addEventListener('click',()=>$('add-room').close());$('load-rooms').addEventListener('click',loadAvailable);$('room-search').addEventListener('input',drawAvailable);$('answer-unapproved').addEventListener('change',async e=>{try{await post('/api/settings',{answer_unapproved_rooms:e.target.checked});await refresh();}catch(err){value('error-notice',err.message);$('error-notice').classList.remove('hidden');}});$('search').addEventListener('input',drawCalls);$('status-filter').addEventListener('change',drawCalls);
 $('clear-filter').addEventListener('click',()=>{scope=null;before=null;$('filter-label').classList.add('hidden');$('clear-filter').classList.add('hidden');refresh();});
 $('older').addEventListener('click',()=>{before=nextBefore;refresh(false);});$('close-details').addEventListener('click',()=>$('details').close());
 document.querySelectorAll('[data-nav]').forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll('[data-nav]').forEach(b=>b.classList.toggle('selected',b===button));$(button.dataset.nav==='calls'?'calls-section':button.dataset.nav==='rooms'?'rooms-section':'bindings-section').scrollIntoView({behavior:'smooth',block:'start'});}));
-refresh();setInterval(()=>{if(!document.hidden&&!$('details').open)refresh();},4000);
+refresh();setInterval(()=>{if(!document.hidden&&!$('details').open&&!$('add-room').open)refresh();},4000);

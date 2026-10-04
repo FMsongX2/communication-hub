@@ -20,6 +20,7 @@ var cleanupClipboard:(()->Void)?=nil
 var openTarget:[String:Any]?=nil
 var attachmentVerification:String?=nil
 var listRows:Int?=nil
+var listedRooms:[[String:Any]]?=nil
 func stamp(_ key:String){
  timing[key]=Date().timeIntervalSince(startedAt)
  if let request=requestKey {
@@ -53,6 +54,7 @@ func finish(_ status:String,_ reason:String="") -> Never {
  r["attachment_sent"]=attachmentSent
  if let check=attachmentVerification {r["attachment_verification"]=check}
  if let rows=listRows {r["list_rows"]=rows}
+ if let rooms=listedRooms {r["rooms"]=rooms}
  r["elapsed_seconds"]=Date().timeIntervalSince(startedAt)
  if let key=requestKey,key.range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil {
  let output=senderState.appendingPathComponent("sender-receipts/"+key+".json")
@@ -201,6 +203,19 @@ func verifyListTarget(_ actualName:String){
 }
 // Registration check from the dashboard: prove the name is unique in the chat list without
 // opening the room or writing anything, and report the list size it was proven at.
+// Dashboard picker: each chat-list row's name (its first static text), read only on the owner's
+// request. Previews, times and counts are not returned.
+if p["list_rooms"] as? Bool == true {
+ let main=windowList().filter{str($0,kAXTitleAttribute)=="카카오톡"}
+ guard main.count==1 else{finish("held","chat_list_window_missing_or_ambiguous")}
+ let tables=collect(main[0]).filter{$0.role==kAXTableRole}
+ guard tables.count==1,let rows=attr(tables[0].element,"AXRows") as? [AXUIElement],!rows.isEmpty,rows.count<=10000 else{finish("held","complete_chat_rows_unavailable")}
+ listedRooms=rows.map{row in
+  ["name":collect(row).filter{$0.role==kAXStaticTextRole}.flatMap{[$0.value,$0.title,$0.description]}.first{!$0.isEmpty} ?? ""]
+ }
+ listRows=rows.count
+ finish("ready","rooms_listed")
+}
 if p["verify_room"] as? Bool == true {
  let main=windowList().filter{str($0,kAXTitleAttribute)=="카카오톡"}
  guard main.count==1 else{finish("held","chat_list_window_missing_or_ambiguous")}
