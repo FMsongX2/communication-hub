@@ -317,19 +317,26 @@ pub async fn deliver(
         .map_err(|_| Uncertain)?;
     Ok(receipt)
 }
-/// Sent at once to a caller whose call has to wait behind another one.
-pub const BUSY_TEXT: &str = "우웅.. 일하고 있엉.. 조금만 기다려줘! (ෆ˙ᵕ˙ෆ)♡";
+/// Sent at once to a caller whose call has to wait behind another one, under the called sister's
+/// prefix. The variant is fixed per call, so a replay journals the same text.
+pub const BUSY_TEXTS: [&str; 3] = [
+    "우웅.. 일하고 있엉.. 조금만 기다려줘! (ෆ˙ᵕ˙ෆ)♡",
+    "으응... 조금만 기다려줘! (˶>⩊<˶)",
+    "웅웅! 잠시만~(๑ˊ͈ ꇴ ˋ͈)♡",
+];
 fn busy_key(e: &Event) -> String {
     digest(format!("busy:{}", e.key()))
 }
 /// A fixed reply plus a code-picked sticker: no model is involved, so it goes out within seconds.
 pub async fn notify_busy(cfg: &Config, store: &Store, e: &Event) -> Result<Value> {
+    let key = busy_key(e);
+    let text = BUSY_TEXTS[key.as_bytes()[63] as usize % BUSY_TEXTS.len()];
     let plan = Plan {
-        reply: format!("{}{BUSY_TEXT}", e.agent.prefix()),
+        reply: format!("{}{text}", e.agent.prefix()),
         bundle_id: None,
         sticker_id: expressions::pick(cfg, store, e).unwrap_or(None),
     };
-    deliver(cfg, store, e, &busy_key(e), "busy", &plan).await
+    deliver(cfg, store, e, &key, "busy", &plan).await
 }
 pub async fn process(
     cfg: &Config,

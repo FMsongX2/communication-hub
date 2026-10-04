@@ -1559,5 +1559,12 @@ async fn busy_notice_is_a_fixed_reply_without_a_model() {
         )
         .unwrap();
     assert_eq!(phase, "busy");
-    assert!(plan.contains("[System-유미] : 우웅.. 일하고 있엉.. 조금만 기다려줘! (ෆ˙ᵕ˙ෆ)♡"));
+    let reply: Value = serde_json::from_str(&plan).unwrap();
+    let reply = reply["reply"].as_str().unwrap();
+    assert!(
+        worker::BUSY_TEXTS
+            .iter()
+            .any(|text| reply == format!("[System-유미] : {text}")),
+        "{reply}"
+    );
 }
