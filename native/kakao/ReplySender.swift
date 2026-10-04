@@ -79,6 +79,12 @@ func collect(_ root:AXUIElement,visibleRowsOnly:Bool=false)->[Node] {
  }
  visit(root,0);return result
 }
+// A just-received trigger is almost always on screen. Visible rows are a subset of the full
+// history, so finding it there implies the full walk would too; only a miss pays for the full walk.
+func collectWithTrigger(_ window:AXUIElement,_ trigger:String)->[Node] {
+ let visible=collect(window,visibleRowsOnly:true)
+ return visible.contains(where:{$0.value==trigger}) ? visible : collect(window)
+}
 guard AXIsProcessTrusted() else{finish("held","accessibility_permission_required")}
 if CommandLine.arguments.contains("--check"){finish("ready")}
 try FileManager.default.createDirectory(at:senderState,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
@@ -137,7 +143,7 @@ func findCandidates()->[(AXUIElement,[Node])] {
  let scope=(p["room_name_verified"] as? Bool == true) ? named : wins
  var found:[(AXUIElement,[Node])]=[]
  for window in scope {
-  let tree=collect(window)
+  let tree=collectWithTrigger(window,trigger)
   if tree.contains(where:{$0.value==trigger}) && tree.contains(where:{$0.isComposer}) {found.append((window,tree))}
  }
  return found
@@ -284,7 +290,7 @@ let originalDraft=str(editor,kAXValueAttribute)
 func sameVerifiedRoom(_ expectedDraft:String)->Bool {
  let named=windowList().filter{str($0,kAXTitleAttribute)==actualName}
  guard named.count==1,CFEqual(named[0],win),str(win,kAXTitleAttribute)==actualName else{return false}
- let fresh=collect(win)
+ let fresh=collectWithTrigger(win,trigger)
  guard fresh.contains(where:{$0.value==trigger}) else{return false}
  let composers=fresh.filter{$0.isComposer}
  guard composers.count==1,CFEqual(composers[0].element,editor),composers[0].value==expectedDraft else{return false}

@@ -20,7 +20,7 @@ First verify foreground operation with the owner-approved configuration. On macO
 </array>
 ```
 
-Replace placeholders with your actual paths and put stdout/stderr logs in a private state directory. Use `launchctl bootstrap gui/$(id -u) PATH_TO_PLIST` after validating your settings. Do not run the GUI adapter as a root LaunchDaemon. The receiver requires Full Disk Access; the sender requires Accessibility. Rebuilding a locally signed helper can require refreshing the same app's permission registration and restarting it.
+Replace placeholders with your actual paths and put stdout/stderr logs in a private state directory. Use `launchctl bootstrap gui/$(id -u) PATH_TO_PLIST` after validating your settings. Do not run the GUI adapter as a root LaunchDaemon. The receiver requires Full Disk Access; the sender requires Accessibility. With ad-hoc signing (the default), macOS binds those permissions to each build's code hash, so every rebuilt helper must be removed and re-added in System Settings and restarted. Sign with a stable local code-signing identity instead (`CODESIGN_IDENTITY="Your Identity" scripts/build-native.sh OUT`): the grant then follows the bundle identifier and certificate, and rebuilds keep it. A self-signed code-signing certificate in the login keychain works without being marked trusted.
 
 ## Inspect and pause
 
