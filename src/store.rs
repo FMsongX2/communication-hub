@@ -430,6 +430,12 @@ impl Store {
             params![key, e.key(), phase, serde_json::to_string(p)?],
         )? == 1)
     }
+    pub fn has_delivery(&self, key: &str) -> Result<bool> {
+        Ok(self
+            .db()?
+            .prepare("SELECT 1 FROM deliveries WHERE key=?")?
+            .exists([key])?)
+    }
     pub fn claim_delivery(&self, key: &str) -> Result<bool> {
         Ok(self.db()?.execute(
             "UPDATE deliveries SET status='sending' WHERE key=? AND status='prepared'",

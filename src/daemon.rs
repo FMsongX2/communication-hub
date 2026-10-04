@@ -267,6 +267,7 @@ fn handle(
                 store,
                 Event::from_kakao(raw, &cfg.kakao.account).map_err(|_| Rejected)?,
                 notify,
+                processing.load(Ordering::SeqCst) && sending.load(Ordering::SeqCst),
             )
         }
         Some("ingest") => ingest(
@@ -274,12 +275,21 @@ fn handle(
             store,
             serde_json::from_value(v["event"].clone()).map_err(|_| Rejected)?,
             notify,
+            processing.load(Ordering::SeqCst) && sending.load(Ordering::SeqCst),
         ),
         _ => Err(Rejected.into()),
     }
 }
 /// One notification may call Yui, Yumi or both; each called sister gets her own event and answer.
-fn ingest(cfg: &Config, store: &Store, event: Event, notify: &Notify) -> Result<Value> {
+/// `working`: another call is being answered and sending is on, so a newly queued caller hears
+/// right away that the sister is busy.
+fn ingest(
+    cfg: &Config,
+    store: &Store,
+    event: Event,
+    notify: &Notify,
+    working: bool,
+) -> Result<Value> {
     cfg.validate_channel(&event.conversation.provider, &event.conversation.account)
         .map_err(|_| Rejected)?;
     let agents: Vec<Agent> = event
@@ -329,6 +339,12 @@ fn ingest(cfg: &Config, store: &Store, event: Event, notify: &Notify) -> Result<
             }
             Ok(()) if store.enqueue(&e)? => {
                 queued = true;
+                if working && cfg.external_auto_send && crate::worker::claim_busy_slot(&e) {
+                    let (cfg, store, e) = (cfg.clone(), store.clone(), e.clone());
+                    tokio::spawn(async move {
+                        let _ = crate::worker::notify_busy(&cfg, &store, &e).await;
+                    });
+                }
                 "queued"
             }
             Ok(()) => "duplicate",

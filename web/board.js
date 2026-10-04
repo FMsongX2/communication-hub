@@ -89,7 +89,7 @@ function details(c){
  wrap.append(grid,elem('h2',null,'호출 원문'),elem('pre',null,c.body||'원문이 저장되지 않은 기록이에요.'));
  wrap.append(elem('h2',null,'접수와 최종 전송'));
  if(!c.deliveries.length)wrap.append(elem('p','muted','전송 기록이 없어요.'));
- for(const d of c.deliveries){const row=elem('div','detail-step');const label=statusLabels[d.status]||[d.status,'neutral'];row.append(elem('span','mono',d.phase==='ack'?'접수':d.phase==='final'?'최종':d.phase),badge(...label));const text=[d.reason,d.verified_chat_name,typeof d.elapsed_seconds==='number'?`${d.elapsed_seconds.toFixed(2)}초`:null,d.attachment_sent===true?'첨부 확인':null].filter(Boolean).join(' · ');row.append(elem('span','muted',text));wrap.append(row);}
+ for(const d of c.deliveries){const row=elem('div','detail-step');const label=statusLabels[d.status]||[d.status,'neutral'];row.append(elem('span','mono',d.phase==='ack'?'접수':d.phase==='busy'?'바쁨 안내':d.phase==='final'?'최종':d.phase),badge(...label));const text=[d.reason,d.verified_chat_name,typeof d.elapsed_seconds==='number'?`${d.elapsed_seconds.toFixed(2)}초`:null,d.attachment_sent===true?'첨부 확인':null].filter(Boolean).join(' · ');row.append(elem('span','muted',text));wrap.append(row);}
  $('details').showModal();
 }
 async function loadCalls(){const params=new URLSearchParams();if(scope)params.set('conversation',scope);if(before)params.set('before',before);const data=await api('/api/calls?'+params);records=data.items;nextBefore=data.next_before;hasMore=data.has_more;drawCalls();}

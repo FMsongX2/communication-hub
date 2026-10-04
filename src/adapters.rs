@@ -263,8 +263,14 @@ fn validate_receipt(result: &mut Value, expected: &str, attachment: bool) {
         *result = json!({"status":"sending_uncertain","reason":"native_target_mismatch"});
     }
 }
+/// One KakaoTalk UI operation at a time: a busy notice, a probe and a reply never interleave.
+fn ui_lock() -> &'static tokio::sync::Mutex<()> {
+    static UI: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    UI.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 impl Kakao {
     async fn native_request(&self, p: &Value) -> Result<Value> {
+        let _ui = ui_lock().lock().await;
         let request = nonce()?;
         let base = &self.cfg.kakao.sender_ipc;
         private_dir(base)?;
