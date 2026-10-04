@@ -105,7 +105,7 @@ if let key=requestKey {
  guard let data=try? Data(contentsOf:senderState.appendingPathComponent("sender-requests/"+key+".json")) else{finish("held","missing_request")}
  raw=data
 } else {raw=FileHandle.standardInput.readDataToEndOfFile()}
-guard let p=(try? JSONSerialization.jsonObject(with:raw)) as? [String:Any],let name=p["chat_name"] as? String,let trigger=p["trigger_body"] as? String,let reply=p["reply"] as? String,!name.isEmpty,!trigger.isEmpty,reply.hasPrefix("[System-유이] : "),reply.count<8192 else{finish("held","invalid_input")}
+guard let p=(try? JSONSerialization.jsonObject(with:raw)) as? [String:Any],let name=p["chat_name"] as? String,let trigger=p["trigger_body"] as? String,let reply=p["reply"] as? String,!name.isEmpty,!trigger.isEmpty,(reply.hasPrefix("[System-유이] : ") || reply.hasPrefix("[System-유미] : ")),reply.count<8192 else{finish("held","invalid_input")}
 let phase=p["phase"] as? String ?? "combined"
 guard phase=="combined" || phase=="attachment_only" else{finish("held","invalid_delivery_phase")}
 if phase=="attachment_only" && p["prior_text_verified"] as? Bool != true {finish("held","prior_text_verification_missing")}

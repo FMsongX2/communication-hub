@@ -26,6 +26,26 @@ pub struct Config {
     pub service_tier: Option<String>,
     #[serde(default)]
     pub expressions: Option<ExpressionConfig>,
+    /// Enables `[유미]` calls answered by Claude. Absent means Yumi tags are ignored.
+    #[serde(default)]
+    pub yumi: Option<YumiConfig>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct YumiConfig {
+    /// The `claude` CLI, logged in with the owner's account.
+    pub claude_bin: PathBuf,
+    /// Yumi's generated global persona (the Claude Code `CLAUDE.md`), loaded on every call.
+    pub persona: PathBuf,
+    #[serde(default = "default_yumi_model")]
+    pub model: String,
+    #[serde(default = "default_yumi_effort")]
+    pub effort: String,
+}
+fn default_yumi_model() -> String {
+    "claude-sonnet-5-5".into()
+}
+fn default_yumi_effort() -> String {
+    "low".into()
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExpressionConfig {

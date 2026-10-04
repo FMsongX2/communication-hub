@@ -1,6 +1,6 @@
 use crate::{
     config::{Config, json_file, private_dir},
-    event::{Conversation, Event, Plan, now},
+    event::{Agent, Conversation, Event, Plan, now},
 };
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -32,7 +32,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS session_policy(conversation TEXT PRIMARY KEY,hash TEXT NOT NULL,applied REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS expression_history(delivery TEXT PRIMARY KEY,conversation TEXT NOT NULL,sha256 TEXT NOT NULL,family TEXT NOT NULL,created REAL NOT NULL,verified INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS expression_room_time ON expression_history(conversation,created DESC);
-            CREATE INDEX IF NOT EXISTS call_log_conversation ON call_log(conversation);")?;
+            CREATE INDEX IF NOT EXISTS call_log_conversation ON call_log(conversation);
+            CREATE TABLE IF NOT EXISTS agent_intro(conversation TEXT NOT NULL,agent TEXT NOT NULL,PRIMARY KEY(conversation,agent));")?;
         std::fs::set_permissions(&s.path, std::fs::Permissions::from_mode(0o600))?;
         Ok(s)
     }
@@ -129,24 +130,47 @@ impl Store {
         self.db()?.execute("INSERT INTO routes(conversation,title) VALUES(?,?) ON CONFLICT(conversation) DO UPDATE SET title=excluded.title",params![c.key(),title])?;
         Ok(())
     }
-    pub fn introduced(&self, c: &Conversation) -> Result<bool> {
-        Ok(self
-            .db()?
-            .query_row(
-                "SELECT introduced FROM routes WHERE conversation=?",
-                [c.key()],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()?
-            .unwrap_or(0)
-            != 0)
+    /// Each sister introduces herself once per room. Yui keeps the original routes column.
+    pub fn introduced(&self, c: &Conversation, agent: Agent) -> Result<bool> {
+        let db = self.db()?;
+        Ok(match agent {
+            Agent::Yui => {
+                db.query_row(
+                    "SELECT introduced FROM routes WHERE conversation=?",
+                    [c.key()],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0)
+                    != 0
+            }
+            Agent::Yumi => db
+                .query_row(
+                    "SELECT 1 FROM agent_intro WHERE conversation=? AND agent='yumi'",
+                    [c.key()],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some(),
+        })
     }
-    pub fn note_intro(&self, c: &Conversation, reply: &str, receipt: &Value) -> Result<()> {
-        if receipt["status"] == "sent_verified"
-            && (reply.contains("Codex[유이]") || reply.contains("여동생 유이"))
-        {
-            self.db()?.execute("INSERT INTO routes(conversation,introduced) VALUES(?,1) ON CONFLICT(conversation) DO UPDATE SET introduced=1",[c.key()])?;
+    pub fn note_intro(
+        &self,
+        c: &Conversation,
+        agent: Agent,
+        reply: &str,
+        receipt: &Value,
+    ) -> Result<()> {
+        let introduced = reply.contains(&format!("여동생 {}", agent.name()))
+            || agent == Agent::Yui && reply.contains("Codex[유이]");
+        if receipt["status"] != "sent_verified" || !introduced {
+            return Ok(());
         }
+        let db = self.db()?;
+        match agent {
+            Agent::Yui => db.execute("INSERT INTO routes(conversation,introduced) VALUES(?,1) ON CONFLICT(conversation) DO UPDATE SET introduced=1",[c.key()])?,
+            Agent::Yumi => db.execute("INSERT OR IGNORE INTO agent_intro VALUES(?,'yumi')",[c.key()])?,
+        };
         Ok(())
     }
     pub fn enqueue(&self, e: &Event) -> Result<bool> {
@@ -159,14 +183,16 @@ impl Store {
         let mut db = self.db()?;
         let scope =
             serde_json::to_string(&json!([e.conversation.provider, e.conversation.account]))?;
-        if db
-            .query_row(
-                "SELECT 1 FROM legacy_events WHERE scope=? AND key=?",
-                params![scope, e.legacy_key()],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()?
-            .is_some()
+        // Imported journals of the earlier bridge only ever held Yui calls.
+        if e.agent == Agent::Yui
+            && db
+                .query_row(
+                    "SELECT 1 FROM legacy_events WHERE scope=? AND key=?",
+                    params![scope, e.legacy_key()],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some()
         {
             return Ok(false);
         }
@@ -194,7 +220,7 @@ impl Store {
                     e.conversation.key(),
                     e.id,
                     e.occurred_at,
-                    if e.body.contains("@[유이]") {
+                    if e.body.contains(e.agent.initial_tag()) {
                         "initial_tag"
                     } else {
                         "followup_tag"

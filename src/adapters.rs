@@ -36,7 +36,7 @@ impl Adapter for Kakao {
     async fn send(&self, store: &Store, key: &str, e: &Event, plan: &Plan) -> Result<Value> {
         self.cfg
             .validate_channel(&e.conversation.provider, &e.conversation.account)?;
-        if !plan.reply.starts_with(crate::event::PREFIX) {
+        if !plan.reply.starts_with(e.agent.prefix()) {
             bail!("invalid_reply_prefix")
         }
         expressions::validate_plan(plan)?;
@@ -100,7 +100,7 @@ impl Adapter for Kakao {
             }
             store.save_route(&e.conversation, name)?;
         }
-        store.note_intro(&e.conversation, &plan.reply, &result)?;
+        store.note_intro(&e.conversation, e.agent, &plan.reply, &result)?;
         Ok(result)
     }
 }
@@ -115,7 +115,7 @@ impl Kakao {
         }
         self.native_request(
             &json!({"chat_name":name,"room_name_verified":route.is_some(),"trigger_body":e.body,
-            "reply":crate::event::PREFIX,"probe":true,"expires_at":crate::event::now()+75.0}),
+            "reply":e.agent.prefix(),"probe":true,"expires_at":crate::event::now()+75.0}),
         )
         .await
     }

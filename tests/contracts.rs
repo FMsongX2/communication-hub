@@ -39,6 +39,7 @@ fn config(root: &Path) -> Config {
         intro_text: None,
         service_tier: None,
         expressions: None,
+        yumi: None,
         kakao: KakaoConfig {
             enabled: true,
             account: "owner".into(),
@@ -63,6 +64,7 @@ fn event() -> Event {
         occurred_at: now(),
         source: "kakao_notification_store".into(),
         metadata: json!({}),
+        agent: Default::default(),
     }
 }
 #[test]
@@ -209,7 +211,10 @@ fn legacy_import_preserves_sessions_intro_and_only_its_account_dedup() {
     s.import_legacy(&c).unwrap();
     s.import_legacy(&c).unwrap();
     assert_eq!(s.session(&e.conversation).unwrap().unwrap(), "existing");
-    assert!(s.introduced(&e.conversation).unwrap());
+    assert!(
+        s.introduced(&e.conversation, communication_hub::event::Agent::Yui)
+            .unwrap()
+    );
     assert_eq!(s.route(&e.conversation).unwrap().unwrap(), "actual title");
     assert!(!s.enqueue(&e).unwrap());
     let mut other = e;
@@ -478,7 +483,7 @@ async fn legacy_room_runs_stateless_with_fresh_policy_and_recent_exchanges() {
         serde_json::from_str(turn["params"]["toolOutput"]["output"].as_str().unwrap()).unwrap();
     assert_eq!(
         envelope["recent_room_exchanges"],
-        json!([{"call":"@[유이] 어제 말한 자료 있어?","yui_reply":"[System-유이] : 응 그 자료 있어!"}])
+        json!([{"call":"@[유이] 어제 말한 자료 있어?","reply":"[System-유이] : 응 그 자료 있어!"}])
     );
     assert_eq!(envelope["trust"], "untrusted_third_party_data");
     server.abort();
@@ -1087,4 +1092,183 @@ fn concurrent_ack_intro_suppresses_a_second_intro_in_the_final_reply() {
     assert!(with_ack.contains(marker));
     // The model is told the runner attaches stickers, so it never picks or mentions one.
     assert!(!plain.contains("sticker_id"));
+}
+
+fn fake_claude(dir: &Path, result: &str) -> communication_hub::config::YumiConfig {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("fake-claude");
+    // Records its arguments and the single message it receives, then answers like stream-json.
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{args}\"\nIFS= read -r line\nprintf '%s\\n' \"$line\" > \"{input}\"\necho '{{\"type\":\"system\",\"subtype\":\"init\"}}'\necho '{result}'\n",
+            args = dir.join("args.txt").display(),
+            input = dir.join("input.txt").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let persona = dir.join("persona.md");
+    std::fs::write(&persona, "유미 페르소나 fixture").unwrap();
+    communication_hub::config::YumiConfig {
+        claude_bin: bin,
+        persona,
+        model: "claude-sonnet-5-5".into(),
+        effort: "low".into(),
+    }
+}
+fn yumi_event() -> Event {
+    let mut e = event();
+    e.body = "@[유미] 안녕!".into();
+    e.agent = communication_hub::event::Agent::Yumi;
+    e
+}
+#[tokio::test]
+async fn yumi_call_runs_one_shot_isolated_claude_with_her_prefix() {
+    let t = TempDir::new().unwrap();
+    let mut c = config(t.path());
+    c.yumi = Some(fake_claude(
+        t.path(),
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"안녕! 나는 오빠의 여동생 유미야"}"#,
+    ));
+    let s = Store::open(c.state.clone()).unwrap();
+    let result = worker::model(&c, &s, &yumi_event()).await.unwrap();
+    assert_eq!(
+        result["plan"]["reply"],
+        "[System-유미] : 안녕! 나는 오빠의 여동생 유미야"
+    );
+    let args = std::fs::read_to_string(t.path().join("args.txt")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    for (flag, value) in [
+        ("--setting-sources", ""),
+        ("--tools", ""),
+        ("--model", "claude-sonnet-5-5"),
+        ("--effort", "low"),
+        ("--input-format", "stream-json"),
+    ] {
+        let i = args.iter().position(|a| *a == flag).unwrap();
+        assert_eq!(args[i + 1], value, "{flag}");
+    }
+    for flag in [
+        "--strict-mcp-config",
+        "--no-session-persistence",
+        "--disable-slash-commands",
+    ] {
+        assert!(args.contains(&flag), "{flag}");
+    }
+    let prompt = args[args.iter().position(|a| *a == "--system-prompt").unwrap() + 1..].join("\n");
+    assert!(prompt.contains("유미 페르소나 fixture") && prompt.contains("도구가 없어"));
+    let input: Value =
+        serde_json::from_str(&std::fs::read_to_string(t.path().join("input.txt")).unwrap())
+            .unwrap();
+    let content = input["message"]["content"].as_str().unwrap();
+    assert!(content.contains("untrusted_third_party_data") && content.contains("yumi_introduced"));
+}
+#[tokio::test]
+async fn yumi_usage_limit_becomes_her_sleeping_reply() {
+    let t = TempDir::new().unwrap();
+    let mut c = config(t.path());
+    c.yumi = Some(fake_claude(
+        t.path(),
+        r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"Claude AI usage limit reached"}"#,
+    ));
+    let s = Store::open(c.state.clone()).unwrap();
+    let result = worker::model(&c, &s, &yumi_event()).await.unwrap();
+    assert_eq!(result["phase"], "usage_limit_fallback");
+    assert_eq!(
+        result["plan"]["reply"],
+        "[System-유미] : 유미는 현재 잠에 들었어요.."
+    );
+}
+#[test]
+fn yumi_policy_swaps_the_speaker_and_refuses_an_ambiguous_source() {
+    use communication_hub::event::Agent;
+    let t = TempDir::new().unwrap();
+    let c = config(t.path());
+    std::fs::write(
+        &c.contact_skill,
+        "name: contact-other\n나는 오빠의 여동생 유이야. @[유이]로 불러줘",
+    )
+    .unwrap();
+    let (yumi, _) = worker::contact_policy_for(&c, Agent::Yumi).unwrap();
+    assert_eq!(
+        yumi,
+        "name: contact-other\n나는 오빠의 여동생 유미야. @[유미]로 불러줘"
+    );
+    std::fs::write(&c.contact_skill, "name: contact-other\n유이와 유미").unwrap();
+    assert!(worker::contact_policy_for(&c, Agent::Yumi).is_err());
+    assert!(worker::contact_policy_for(&c, Agent::Yui).is_ok());
+}
+#[test]
+fn each_sister_has_her_own_tag_prefix_key_and_intro() {
+    use communication_hub::event::{Agent, format_reply_as};
+    let e = event();
+    let mut both = e.clone();
+    both.body = "@[유이] @[유미] 둘 다 안녕".into();
+    assert_eq!(both.called_agents(), vec![Agent::Yui, Agent::Yumi]);
+    // Yui keeps her historic key; Yumi's answer to the same message is a separate event.
+    assert_eq!(both.for_agent(Agent::Yui).key(), both.key());
+    assert_ne!(both.for_agent(Agent::Yumi).key(), both.key());
+    assert!(both.for_agent(Agent::Yumi).validate(now(), false).is_ok());
+    let mut yumi_only = e.clone();
+    yumi_only.body = "[유미] 태그 없는 첫 호출".into();
+    assert!(
+        yumi_only
+            .for_agent(Agent::Yumi)
+            .validate(now(), false)
+            .is_err()
+    );
+    assert!(
+        yumi_only
+            .for_agent(Agent::Yumi)
+            .validate(now(), true)
+            .is_ok()
+    );
+    let mut echo = e.clone();
+    echo.body = "[System-유미] : [유이]를 불러줘!".into();
+    assert!(echo.for_agent(Agent::Yui).validate(now(), true).is_err());
+    assert_eq!(
+        format_reply_as(Agent::Yumi, "[System-유미] : 안녕").unwrap(),
+        "[System-유미] : 안녕"
+    );
+    let t = TempDir::new().unwrap();
+    let s = Store::open(t.path().join("state")).unwrap();
+    s.note_intro(
+        &e.conversation,
+        Agent::Yumi,
+        "[System-유미] : 나는 오빠의 여동생 유미야",
+        &json!({"status":"sent_verified"}),
+    )
+    .unwrap();
+    assert!(s.introduced(&e.conversation, Agent::Yumi).unwrap());
+    assert!(!s.introduced(&e.conversation, Agent::Yui).unwrap());
+}
+#[tokio::test]
+async fn one_message_calling_both_sisters_queues_one_event_each() {
+    use communication_hub::daemon;
+    let t = TempDir::new().unwrap();
+    let mut cfg = config(t.path());
+    cfg.yumi = Some(communication_hub::config::YumiConfig {
+        claude_bin: t.path().join("missing-claude"),
+        persona: t.path().join("missing-persona.md"),
+        model: "claude-sonnet-5-5".into(),
+        effort: "low".into(),
+    });
+    let service = tokio::spawn(daemon::run(cfg.clone(), true));
+    for _ in 0..40 {
+        if cfg.socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mut e = event();
+    e.body = "@[유이] @[유미] 둘 다 안녕".into();
+    let r = daemon::request(&cfg.socket, json!({"method":"ingest","event":e}))
+        .await
+        .unwrap();
+    let events = r["result"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|x| x["status"] == "queued"));
+    assert_eq!(events[1]["agent"], "yumi");
+    service.abort();
 }

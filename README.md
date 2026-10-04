@@ -110,6 +110,16 @@ Each call is stateless: it runs in a fresh ephemeral backend thread with the cur
 
 `intro_text` optionally controls the deterministic first acknowledgement's introduction. Fixed acknowledgement variants use brief informal Korean. The acknowledgement runs while the model generates instead of before it; with `kakao.prewarm=true`, other calls run a send-free target probe at the same time. The native sender's full chat-list scan proves the room name is unique; a send that finds the room already open reuses that proof only when it came from the same event, name and list size within 90 seconds, and a room opened from the list is always rescanned. Configure `service_tier` (e.g. `"priority"` for a catalog-advertised Fast tier) only when your backend/model supports it. The hub forwards it at both session and turn boundaries, independently of `model` and `effort`. Fast can consume more allowance; a configured tier is not a latency guarantee.
 
+## Optional second persona: Yumi via Claude
+
+With a `yumi` block, `@[유미]`/`[유미]` calls are answered by Claude Code in addition to Yui's Codex backend; a message tagging both gets one answer from each, as separate events:
+
+```json
+{"yumi":{"claude_bin":"/absolute/path/to/claude","persona":"/absolute/path/to/CLAUDE.md","model":"claude-sonnet-5-5","effort":"low"}}
+```
+
+Each call is stateless and tool-free: one pre-spawned `claude -p` process (stream-json input) answers exactly one message and exits, and the next is spawned in the background, so CLI start-up stays off the reply path. User settings, hooks, MCP servers, skills, tools and session persistence are disabled, so the CLI's own `CLAUDE.md` loading is off too; the configured persona file, Contact-Other with Yumi as the speaker, and the call rules form the system prompt. Requests that need files are redirected to `[유이]`. Replies use the `[System-유미] : ` prefix, which is also rejected as an echo. The CLI must be logged in with the owner's account. If the Contact-Other source ever names Yumi, the speaker swap is ambiguous and Yumi calls stop instead of guessing.
+
 ## Optional expression catalog
 
 Set `expressions` in the private config to use an operator-owned sticker catalog:

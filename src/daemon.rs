@@ -1,6 +1,6 @@
 use crate::{
     config::{Config, atomic, private_dir},
-    event::{Event, now},
+    event::{Agent, Event, now},
     store::Store,
     worker,
 };
@@ -92,6 +92,9 @@ pub async fn run(cfg: Config, no_receiver: bool) -> Result<()> {
     let sending = Arc::new(AtomicBool::new(cfg.external_auto_send && !paused));
     let processing = Arc::new(AtomicBool::new(false));
     let cfg = Arc::new(cfg);
+    // Yumi's first call should not pay the CLI start-up either.
+    let warm_cfg = cfg.clone();
+    tokio::spawn(async move { crate::worker::warm_yumi(&warm_cfg).await });
     let board_tasks = crate::dashboard::start(
         cfg.clone(),
         store.clone(),
@@ -275,18 +278,41 @@ fn handle(
         _ => Err(Rejected.into()),
     }
 }
+/// One notification may call Yui, Yumi or both; each called sister gets her own event and answer.
 fn ingest(cfg: &Config, store: &Store, event: Event, notify: &Notify) -> Result<Value> {
     cfg.validate_channel(&event.conversation.provider, &event.conversation.account)
         .map_err(|_| Rejected)?;
-    if let Err(reason) = event.validate(now(), store.initialized(&event.conversation)?) {
-        if event.body.contains("[유이]") {
-            store.record_rejected(&event, &reason.to_string())?;
-        }
-        return Err(Rejected.into());
+    let agents: Vec<Agent> = event
+        .called_agents()
+        .into_iter()
+        .filter(|a| *a == Agent::Yui || cfg.yumi.is_some())
+        .collect();
+    let initialized = store.initialized(&event.conversation)?;
+    let mut results = Vec::new();
+    let mut queued = false;
+    for agent in agents {
+        let e = event.for_agent(agent);
+        let status = match e.validate(now(), initialized) {
+            Err(reason) => {
+                store.record_rejected(&e, &reason.to_string())?;
+                "rejected"
+            }
+            Ok(()) if store.enqueue(&e)? => {
+                queued = true;
+                "queued"
+            }
+            Ok(()) => "duplicate",
+        };
+        results.push(json!({"agent":agent,"event_key":e.key(),"status":status}));
     }
-    let added = store.enqueue(&event)?;
-    if added {
+    if queued {
         notify.notify_one()
     }
-    Ok(json!({"event_key":event.key(),"status":if added{"queued"}else{"duplicate"}}))
+    if results.iter().all(|r| r["status"] == "rejected") {
+        return Err(Rejected.into());
+    }
+    Ok(match results.len() {
+        1 => results.remove(0),
+        _ => json!({"events":results}),
+    })
 }
