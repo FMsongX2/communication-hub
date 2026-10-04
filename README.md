@@ -67,6 +67,20 @@ Use the installed binary's full path or add its `bin` directory to your PATH. A 
 
 When sending, the helper rechecks the conversation and trigger, rejects ambiguous names, preserves an existing draft, and verifies a new outgoing bubble. It does not move or click the mouse pointer. It can temporarily bring KakaoTalk forward and send a key to that process. Locked sessions, unavailable Accessibility rows, or ambiguous targets are held.
 
+## Local management board
+
+Enable the optional board in your private configuration:
+
+```json
+"dashboard": { "port": 43197, "store_body": false }
+```
+
+After restarting the hub, run `communication-hub board --open`. This opens an authenticated local board; `communication-hub board` reports its clean URL. It binds only to `127.0.0.1`, requires a rotating bearer token for private APIs, and performs read-only observation. A public page or unauthenticated browser cannot read the session/call data.
+
+The board shows provider/account/conversation-to-thread bindings, receiver heartbeat, backend connection, stored/idle/active session state, tag and receipt logs, filters, pagination, and call details. `notLoaded` means persisted but not loaded; it does not mean forgotten. Session inspection uses `thread/read` without starting or resuming a model turn. Connection freshness is displayed separately from dispatch/send gates and does not represent participants' chat presence.
+
+New call metadata survives payload cleanup. Original bodies are kept only when `store_body=true`; this is private local retention, not public data. Earlier deleted bodies/tags are not reconstructed. A unique verified receipt can associate an older record with a binding, but does not prove its original prompt or sender identity. Tagged calls rejected before model dispatch are logged as rejected; untagged chat traffic is not collected as call history. New installs keep the board disabled unless configured.
+
 ## Boundaries and limitations
 
 - Accessibility scans can be slow on large histories. Notification polling is currently three seconds. Focused/muted rooms, disabled previews, and some self-messages may produce no usable notification. No notification means no call.

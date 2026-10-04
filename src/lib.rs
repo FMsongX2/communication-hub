@@ -2,6 +2,7 @@ pub mod adapters;
 pub mod attachments;
 pub mod config;
 pub mod daemon;
+pub mod dashboard;
 pub mod event;
 pub mod rpc;
 pub mod store;

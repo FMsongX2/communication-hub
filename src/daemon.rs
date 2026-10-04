@@ -82,7 +82,8 @@ pub async fn run(cfg: Config, no_receiver: bool) -> Result<()> {
     }
     let listener = UnixListener::bind(&cfg.socket)?;
     std::fs::set_permissions(&cfg.socket, std::fs::Permissions::from_mode(0o600))?;
-    let store = Store::open(cfg.state.clone())?;
+    let mut store = Store::open(cfg.state.clone())?;
+    store.store_bodies = cfg.dashboard.as_ref().is_some_and(|d| d.store_body);
     store.import_legacy(&cfg)?;
     store.recover()?;
     let notify = Arc::new(Notify::new());
@@ -91,6 +92,14 @@ pub async fn run(cfg: Config, no_receiver: bool) -> Result<()> {
     let sending = Arc::new(AtomicBool::new(cfg.external_auto_send && !paused));
     let processing = Arc::new(AtomicBool::new(false));
     let cfg = Arc::new(cfg);
+    let board_tasks = crate::dashboard::start(
+        cfg.clone(),
+        store.clone(),
+        active.clone(),
+        sending.clone(),
+        processing.clone(),
+    )
+    .await?;
     let processing_task = {
         let (cfg, store, notify, active, sending, processing) = (
             cfg.clone(),
@@ -194,6 +203,14 @@ pub async fn run(cfg: Config, no_receiver: bool) -> Result<()> {
     if let Some(task) = receiver_task {
         task.abort()
     }
+    if let Some((server, probe)) = board_tasks {
+        server.abort();
+        probe.abort();
+        let _ = atomic(
+            &cfg.state.join("dashboard-status.json"),
+            &json!({"online":false,"at":now()}),
+        );
+    }
     let _ = std::fs::remove_file(&cfg.socket);
     drop(lock);
     Ok(())
@@ -261,9 +278,12 @@ fn handle(
 fn ingest(cfg: &Config, store: &Store, event: Event, notify: &Notify) -> Result<Value> {
     cfg.validate_channel(&event.conversation.provider, &event.conversation.account)
         .map_err(|_| Rejected)?;
-    event
-        .validate(now(), store.session(&event.conversation)?.is_some())
-        .map_err(|_| Rejected)?;
+    if let Err(reason) = event.validate(now(), store.session(&event.conversation)?.is_some()) {
+        if event.body.contains("[유이]") {
+            store.record_rejected(&event, &reason.to_string())?;
+        }
+        return Err(Rejected.into());
+    }
     let added = store.enqueue(&event)?;
     if added {
         notify.notify_one()

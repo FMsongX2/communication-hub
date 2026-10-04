@@ -18,6 +18,14 @@ pub struct Config {
     pub effort: String,
     #[serde(default = "yes")]
     pub dispatch_enabled: bool,
+    #[serde(default)]
+    pub dashboard: Option<DashboardConfig>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardConfig {
+    pub port: u16,
+    #[serde(default)]
+    pub store_body: bool,
 }
 fn yes() -> bool {
     true

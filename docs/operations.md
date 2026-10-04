@@ -70,3 +70,11 @@ Create `attachment-bundles.json` in the configured Kakao data directory. Each co
 Build and test a new binary separately. Pause, wait for in-flight work, replace the installed binary atomically, and restart the user service. Confirm a new PID and a fresh heartbeat before resuming. Preserve the databases and pause state. Coordinate native helper changes with the config's IPC/state paths and macOS grants.
 
 Optional legacy import reads old Kakao session, route, introduction, and event files from the configured Kakao data directory. Pending legacy work blocks import. Stop the old worker before cutover. Returning to an older implementation requires comparing both journals: completed/uncertain events are not synchronized back automatically. Do not delete history to force a replay.
+
+## Board and call-log retention
+
+The optional `dashboard` object controls the loopback port and `store_body` flag. No board is started when omitted. Use `board --open` rather than sharing its authentication fragment. The browser strips that fragment and keeps the read-only token in tab session storage; reopening the board is required after the service rotates it on restart.
+
+`call_log` joins accepted/rejected calls to the durable event journal. It stores provider/account/conversation identity, message ID, observed tag, occurrence time, notification title, and optionally original body. The notification title is not authenticated sender identity. Do not export screenshots or DBs containing actual calls into the public repository. Body retention has no automatic expiration yet; set `store_body=false` before collecting sensitive workflows unless retention is intended. Previously stored bodies remain until the operator manages retention.
+
+The board refreshes visible state every four seconds; backend observation runs on a bounded fifteen-second cycle and only reads metadata. Unavailable or stale probes are shown as unknown/offline, while `notLoaded` remains a stored-session state. Optional HTTP bind failure leaves the hub worker operational and records `port_unavailable`.

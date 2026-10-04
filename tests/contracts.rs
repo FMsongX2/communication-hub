@@ -35,6 +35,7 @@ fn config(root: &Path) -> Config {
         model: worker::MODEL.into(),
         effort: worker::EFFORT.into(),
         dispatch_enabled: false,
+        dashboard: None,
         kakao: KakaoConfig {
             enabled: true,
             account: "owner".into(),
@@ -555,6 +556,166 @@ async fn storage_failure_is_retryable_not_permanent_ingestion_rejection() {
     task.abort();
 }
 
+#[test]
+fn call_logs_survive_payload_removal_and_respect_body_opt_in() {
+    let t = TempDir::new().unwrap();
+    let mut s = Store::open(t.path().join("state")).unwrap();
+    let mut e = event();
+    s.enqueue(&e).unwrap();
+    s.finish_event(&e.key(), "held", "fixture").unwrap();
+    assert_eq!(
+        s.calls(None, None, 10).unwrap()["items"][0]["body"],
+        Value::Null
+    );
+    s.store_bodies = true;
+    e.id = "with-body".into();
+    e.body = "[유이] <script>untrusted</script>".into();
+    s.enqueue(&e).unwrap();
+    s.finish_event(&e.key(), "sent_verified", "").unwrap();
+    let records = s.calls(Some(&e.conversation.key()), None, 10).unwrap();
+    assert_eq!(records["items"].as_array().unwrap().len(), 2);
+    assert_eq!(records["items"][0]["body"], e.body);
+    assert_eq!(records["items"][0]["trigger_kind"], "followup_tag");
+    assert!(!s.enqueue(&e).unwrap());
+    assert_eq!(
+        s.calls(None, None, 100).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn historical_log_does_not_invent_original_body_or_trigger() {
+    let t = TempDir::new().unwrap();
+    let s = Store::open(t.path().join("state")).unwrap();
+    let e = event();
+    s.save_session(&e.conversation, "persisted").unwrap();
+    s.save_route(&e.conversation, "fixture-room").unwrap();
+    s.db()
+        .unwrap()
+        .execute(
+            "INSERT INTO events VALUES('legacy','','sent_verified',NULL,1,2)",
+            [],
+        )
+        .unwrap();
+    let p = Plan {
+        reply: "[System-유이] : fixture".into(),
+        bundle_id: None,
+    };
+    s.prepare("receipt", &e, "final", &p).unwrap();
+    s.db()
+        .unwrap()
+        .execute(
+            "UPDATE deliveries SET event_key='legacy',receipt=?",
+            [json!({"verified_chat_name":"fixture-room","status":"sent_verified"}).to_string()],
+        )
+        .unwrap();
+    let logs = s.calls(Some(&e.conversation.key()), None, 10).unwrap();
+    let r = &logs["items"][0];
+    assert_eq!(r["historical_metadata_missing"], true);
+    assert!(r["body"].is_null() && r["trigger_kind"].is_null());
+    assert_eq!(r["conversation_key"], e.conversation.key());
+}
+
+#[test]
+fn dashboard_auth_denies_missing_token_and_other_origins() {
+    use axum::http::{HeaderMap, header};
+    let token = "a".repeat(64);
+    let origin = "http://127.0.0.1:43197";
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, "127.0.0.1:43197".parse().unwrap());
+    assert!(!communication_hub::dashboard::authorized(
+        &headers, &token, origin
+    ));
+    headers.insert(
+        header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    assert!(communication_hub::dashboard::authorized(
+        &headers, &token, origin
+    ));
+    headers.insert(header::ORIGIN, "https://untrusted.example".parse().unwrap());
+    assert!(!communication_hub::dashboard::authorized(
+        &headers, &token, origin
+    ));
+    headers.remove(header::ORIGIN);
+    headers.insert(header::HOST, "attacker.example:43197".parse().unwrap());
+    assert!(!communication_hub::dashboard::authorized(
+        &headers, &token, origin
+    ));
+}
+
+#[test]
+fn source_heartbeat_is_not_mistaken_for_online_forever() {
+    use communication_hub::dashboard::source_health;
+    let v = json!({"status":"watching_kakao_only","received_at":100});
+    assert_eq!(source_health(true, &v, 102.0)["status"], "online");
+    assert_eq!(source_health(true, &v, 111.0)["status"], "offline");
+    assert_eq!(source_health(false, &v, 102.0)["status"], "disabled");
+    assert_eq!(
+        source_health(
+            true,
+            &json!({"status":"permission_or_storage_blocked","received_at":100}),
+            102.0
+        )["status"],
+        "blocked"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_private_api_requires_auth_and_serves_no_token_in_html() {
+    use communication_hub::dashboard::{Board, router};
+    use http_body_util::BodyExt;
+    use std::sync::atomic::AtomicBool;
+    use tower::ServiceExt;
+    let t = TempDir::new().unwrap();
+    let cfg = config(t.path());
+    let store = Store::open(cfg.state.clone()).unwrap();
+    let e = event();
+    store
+        .save_session(&e.conversation, "sample-thread")
+        .unwrap();
+    let token = "b".repeat(64);
+    let board = Board {
+        cfg: Arc::new(cfg),
+        store,
+        active: Arc::new(AtomicBool::new(false)),
+        sending: Arc::new(AtomicBool::new(false)),
+        processing: Arc::new(AtomicBool::new(false)),
+        backend: Arc::new(tokio::sync::RwLock::new(json!({}))),
+        token: token.clone(),
+        origin: "http://127.0.0.1:43197".into(),
+    };
+    let app = router(board);
+    let request = |path: &str, auth: bool| {
+        let mut r = axum::http::Request::builder()
+            .uri(path)
+            .header("host", "127.0.0.1:43197");
+        if auth {
+            r = r.header("authorization", format!("Bearer {token}"));
+        }
+        r.body(axum::body::Body::empty()).unwrap()
+    };
+    let r = app
+        .clone()
+        .oneshot(request("/api/snapshot", false))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), axum::http::StatusCode::UNAUTHORIZED);
+    let r = app.clone().oneshot(request("/", false)).await.unwrap();
+    let html =
+        String::from_utf8(r.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(!html.contains(&token) && !html.contains("sample-thread"));
+    let r = app.oneshot(request("/api/snapshot", true)).await.unwrap();
+    assert_eq!(r.headers()["cache-control"], "no-store");
+    let v: Value =
+        serde_json::from_slice(&r.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["bindings"][0]["thread_id"], "sample-thread");
+    assert_eq!(v["bindings"][0]["call_available"], false);
+}
+
 #[tokio::test]
 async fn actual_rpc_usage_limit_produces_exact_fallback() {
     let t = TempDir::new().unwrap();
@@ -590,4 +751,84 @@ async fn actual_rpc_usage_limit_produces_exact_fallback() {
         "[System-유이] : 유이는 현재 잠에 들었어요.."
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn dashboard_observation_never_starts_or_resumes_a_model_session() {
+    use communication_hub::dashboard::{Board, monitor};
+    use std::sync::atomic::AtomicBool;
+    let t = TempDir::new().unwrap();
+    let cfg = config(t.path());
+    let store = Store::open(cfg.state.clone()).unwrap();
+    store
+        .save_session(&event().conversation, "observed")
+        .unwrap();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let capture = calls.clone();
+    let listener = tokio::net::UnixListener::bind(&cfg.app_server_socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) = ws.next().await {
+            let v: Value = serde_json::from_str(&text).unwrap();
+            let method = v["method"].as_str().unwrap_or("").to_owned();
+            capture.lock().unwrap().push(method.clone());
+            if v.get("id").is_none() {
+                continue;
+            }
+            let result = if method == "thread/read" {
+                json!({"thread":{"id":"observed","status":{"type":"notLoaded"}}})
+            } else {
+                json!({})
+            };
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"id":v["id"],"result":result}).to_string().into(),
+            ))
+            .await
+            .unwrap();
+        }
+    });
+    let state = Arc::new(tokio::sync::RwLock::new(json!({})));
+    let board = Board {
+        cfg: Arc::new(cfg),
+        store,
+        active: Arc::new(AtomicBool::new(false)),
+        sending: Arc::new(AtomicBool::new(false)),
+        processing: Arc::new(AtomicBool::new(false)),
+        backend: state.clone(),
+        token: "c".repeat(64),
+        origin: "http://127.0.0.1:43197".into(),
+    };
+    let probe = tokio::spawn(monitor(board));
+    for _ in 0..100 {
+        if state.read().await["online"] == true {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(state.read().await["online"], true);
+    let methods = calls.lock().unwrap();
+    assert!(methods.iter().any(|m| m == "thread/read"));
+    assert!(
+        methods
+            .iter()
+            .all(|m| matches!(m.as_str(), "initialize" | "initialized" | "thread/read"))
+    );
+    probe.abort();
+    server.abort();
+}
+
+#[test]
+fn rejected_calls_are_visible_without_becoming_pending_jobs() {
+    let t = TempDir::new().unwrap();
+    let mut store = Store::open(t.path().join("state")).unwrap();
+    store.store_bodies = true;
+    let mut e = event();
+    e.body = "[유이] first call without initialization".into();
+    store.record_rejected(&e, "room_not_initialized").unwrap();
+    assert!(store.claim_next().unwrap().is_none());
+    let r = store.calls(None, None, 10).unwrap();
+    assert_eq!(r["items"][0]["status"], "rejected");
+    assert_eq!(r["items"][0]["reason"], "room_not_initialized");
+    assert_eq!(r["items"][0]["body"], e.body);
 }

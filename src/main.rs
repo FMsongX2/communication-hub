@@ -31,6 +31,10 @@ enum Command {
     Adapters,
     Pause,
     Resume,
+    Board {
+        #[arg(long)]
+        open: bool,
+    },
     Ingest {
         #[arg(long)]
         file: PathBuf,
@@ -79,6 +83,39 @@ async fn execute() -> Result<()> {
         Command::Adapters => daemon::request(&cfg.socket, json!({"method":"adapters"})).await?,
         Command::Pause => daemon::request(&cfg.socket, json!({"method":"pause"})).await?,
         Command::Resume => daemon::request(&cfg.socket, json!({"method":"resume"})).await?,
+        Command::Board { open } => {
+            let info =
+                communication_hub::config::json_file(&cfg.state.join("dashboard-status.json"))?;
+            if info["online"] != true {
+                bail!("dashboard_not_running")
+            }
+            // Verify the hub itself is reachable; old status files alone are insufficient.
+            let running = daemon::request(&cfg.socket, json!({"method":"status"})).await?;
+            if running["result"]["pid"] != info["pid"] {
+                bail!("dashboard_status_is_stale")
+            }
+            if open {
+                let auth =
+                    communication_hub::config::json_file(&cfg.state.join("dashboard-auth.json"))?;
+                let url = format!(
+                    "{}#token={}",
+                    info["url"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("dashboard_url_missing"))?,
+                    auth["token"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("dashboard_auth_missing"))?
+                );
+                let ok = tokio::process::Command::new("/usr/bin/open")
+                    .arg(url)
+                    .status()
+                    .await?;
+                if !ok.success() {
+                    bail!("browser_open_failed")
+                }
+            }
+            info
+        }
         Command::Ingest { file } => {
             daemon::request(&cfg.socket, json!({"method":"ingest","event":load(&file)?})).await?
         }

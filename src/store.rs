@@ -10,6 +10,7 @@ use std::path::PathBuf;
 #[derive(Clone)]
 pub struct Store {
     pub path: PathBuf,
+    pub store_bodies: bool,
 }
 impl Store {
     pub fn open(state: PathBuf) -> Result<Self> {
@@ -17,6 +18,7 @@ impl Store {
         private_dir(&state)?;
         let s = Self {
             path: state.join("hub.sqlite3"),
+            store_bodies: false,
         };
         let db = s.db()?;
         db.execute_batch("PRAGMA journal_mode=WAL;
@@ -26,6 +28,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS deliveries(key TEXT PRIMARY KEY,event_key TEXT NOT NULL,phase TEXT NOT NULL,plan TEXT NOT NULL,status TEXT NOT NULL,receipt TEXT);
             CREATE TABLE IF NOT EXISTS legacy_events(scope TEXT,key TEXT,PRIMARY KEY(scope,key));
             CREATE TABLE IF NOT EXISTS migrations(name TEXT PRIMARY KEY);")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS call_log(event_key TEXT PRIMARY KEY,conversation TEXT NOT NULL,message_id TEXT NOT NULL,occurred REAL NOT NULL,trigger_kind TEXT NOT NULL,notification_title TEXT NOT NULL,body TEXT);
+            CREATE INDEX IF NOT EXISTS call_log_conversation ON call_log(conversation);")?;
         std::fs::set_permissions(&s.path, std::fs::Permissions::from_mode(0o600))?;
         Ok(s)
     }
@@ -82,7 +86,13 @@ impl Store {
         Ok(())
     }
     pub fn enqueue(&self, e: &Event) -> Result<bool> {
-        let db = self.db()?;
+        self.record_event(e, "pending", None)
+    }
+    pub fn record_rejected(&self, e: &Event, reason: &str) -> Result<bool> {
+        self.record_event(e, "rejected", Some(reason))
+    }
+    fn record_event(&self, e: &Event, status: &str, reason: Option<&str>) -> Result<bool> {
+        let mut db = self.db()?;
         let scope =
             serde_json::to_string(&json!([e.conversation.provider, e.conversation.account]))?;
         if db
@@ -96,10 +106,46 @@ impl Store {
         {
             return Ok(false);
         }
-        Ok(db.execute(
-            "INSERT OR IGNORE INTO events VALUES(?,?,'pending',NULL,?,?)",
-            params![e.key(), serde_json::to_string(e)?, now(), now()],
-        )? == 1)
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let added = tx.execute(
+            "INSERT OR IGNORE INTO events VALUES(?,?,?,?,?,?)",
+            params![
+                e.key(),
+                if status == "pending" {
+                    serde_json::to_string(e)?
+                } else {
+                    String::new()
+                },
+                status,
+                reason,
+                now(),
+                now()
+            ],
+        )? == 1;
+        if added {
+            tx.execute(
+                "INSERT INTO call_log VALUES(?,?,?,?,?,?,?)",
+                params![
+                    e.key(),
+                    e.conversation.key(),
+                    e.id,
+                    e.occurred_at,
+                    if e.body.contains("@[유이]") {
+                        "initial_tag"
+                    } else {
+                        "followup_tag"
+                    },
+                    e.title,
+                    if self.store_bodies {
+                        Some(e.body.as_str())
+                    } else {
+                        None
+                    }
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(added)
     }
     pub fn claim_next(&self) -> Result<Option<Event>> {
         let mut db = self.db()?;
@@ -173,6 +219,114 @@ impl Store {
         Ok(
             json!({"events":events,"deliveries":deliveries,"sessions":db.query_row("SELECT count(*) FROM sessions",[],|r|r.get::<_,i64>(0))?}),
         )
+    }
+    pub fn bindings(&self) -> Result<Vec<Value>> {
+        let db = self.db()?;
+        let mut stmt=db.prepare("SELECT s.conversation,s.thread,r.title,r.introduced,(SELECT max(e.created) FROM call_log c JOIN events e ON c.event_key=e.key WHERE c.conversation=s.conversation),(SELECT count(*) FROM call_log c JOIN events e ON c.event_key=e.key WHERE c.conversation=s.conversation),(SELECT count(*) FROM call_log c JOIN events e ON c.event_key=e.key WHERE c.conversation=s.conversation AND e.status='dispatching') FROM sessions s LEFT JOIN routes r ON s.conversation=r.conversation ORDER BY s.conversation")?;
+        let mut items = Vec::new();
+        for row in stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<f64>>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        })? {
+            let (key, thread, title, introduced, last, count, busy) = row?;
+            let parts: Vec<String> = serde_json::from_str(&key)?;
+            items.push(json!({"key":key,"provider":parts[0],"account":parts[1],"conversation_id":parts[2],"thread_id":thread,"title":title,"introduced":introduced.unwrap_or(0)!=0,"last_call_at":last,"recorded_calls":count,"processing":busy>0}));
+        }
+        Ok(items)
+    }
+    pub fn calls(
+        &self,
+        conversation: Option<&str>,
+        before: Option<f64>,
+        limit: usize,
+    ) -> Result<Value> {
+        let db = self.db()?;
+        let mut stmt=db.prepare("SELECT e.key,e.status,e.reason,e.created,e.updated,c.conversation,c.message_id,c.occurred,c.trigger_kind,c.notification_title,c.body FROM events e LEFT JOIN call_log c ON c.event_key=e.key WHERE (?1 IS NULL OR c.conversation=?1 OR c.conversation IS NULL) AND (?2 IS NULL OR e.created<?2) ORDER BY e.created DESC LIMIT ?3")?;
+        let mut result = Vec::new();
+        let mut cursor = Value::Null;
+        let mut scanned = 0usize;
+        for row in stmt.query_map(
+            params![conversation, before, limit.clamp(1, 100) as i64],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, f64>(3)?,
+                    r.get::<_, f64>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<f64>>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                    r.get::<_, Option<String>>(9)?,
+                    r.get::<_, Option<String>>(10)?,
+                ))
+            },
+        )? {
+            let (
+                key,
+                status,
+                reason,
+                created,
+                updated,
+                scope,
+                message_id,
+                occurred,
+                trigger,
+                notification_title,
+                body,
+            ) = row?;
+            scanned += 1;
+            cursor = json!(created);
+            let mut deliveries_stmt = db.prepare(
+                "SELECT phase,status,receipt FROM deliveries WHERE event_key=? ORDER BY rowid",
+            )?;
+            let mut deliveries = Vec::new();
+            for d in deliveries_stmt.query_map([&key], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })? {
+                let (phase, status, receipt) = d?;
+                let raw: Value = receipt
+                    .map(|s| serde_json::from_str(&s))
+                    .transpose()?
+                    .unwrap_or(json!({}));
+                deliveries.push(json!({"phase":phase,"status":status,"reason":raw["reason"],"verified_chat_name":raw["verified_chat_name"],"text_sent":raw["text_sent"],"attachment_sent":raw["attachment_sent"],"elapsed_seconds":raw["elapsed_seconds"]}));
+            }
+            // Only infer a legacy binding from a unique verified receipt title;
+            // never invent the original prompt, caller or trigger tag.
+            let mut scope = scope;
+            if scope.is_none() {
+                let title = deliveries
+                    .iter()
+                    .find_map(|d| d["verified_chat_name"].as_str());
+                if let Some(title) = title {
+                    let mut q =
+                        db.prepare("SELECT conversation FROM routes WHERE title=? LIMIT 2")?;
+                    let matches = q
+                        .query_map([title], |r| r.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    if matches.len() == 1 {
+                        scope = Some(matches[0].clone())
+                    }
+                }
+            }
+            if conversation.is_some_and(|wanted| scope.as_deref() != Some(wanted)) {
+                continue;
+            }
+            result.push(json!({"event_key":key,"status":status,"reason":reason,"received_at":created,"updated_at":updated,"conversation_key":scope,"message_id":message_id,"occurred_at":occurred,"trigger_kind":trigger,"notification_title":notification_title,"sender_verified":false,"body":body,"historical_metadata_missing":trigger.is_none(),"deliveries":deliveries}));
+        }
+        Ok(json!({"items":result,"next_before":cursor,"has_more":scanned>=limit.clamp(1,100)}))
     }
     pub fn import_legacy(&self, cfg: &Config) -> Result<()> {
         if !cfg.kakao.enabled {
