@@ -82,19 +82,38 @@ impl Store {
             .execute("INSERT INTO sessions VALUES(?,?)", params![c.key(), thread])?;
         Ok(())
     }
-    pub fn policy_hash(&self, c: &Conversation) -> Result<Option<String>> {
-        Ok(self
-            .db()?
-            .query_row(
-                "SELECT hash FROM session_policy WHERE conversation=?",
-                [c.key()],
-                |r| r.get(0),
-            )
-            .optional()?)
+    /// A room is initialized once it has a legacy session or a reply verified in it.
+    pub fn initialized(&self, c: &Conversation) -> Result<bool> {
+        Ok(self.db()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE conversation=?1) OR EXISTS(SELECT 1 FROM routes WHERE conversation=?1 AND title IS NOT NULL)",
+            [c.key()],
+            |r| r.get(0),
+        )?)
     }
-    pub fn note_policy(&self, c: &Conversation, hash: &str) -> Result<()> {
-        self.db()?.execute("INSERT INTO session_policy VALUES(?,?,?) ON CONFLICT(conversation) DO UPDATE SET hash=excluded.hash,applied=excluded.applied",params![c.key(),hash,now()])?;
-        Ok(())
+    /// The room's last answered calls, oldest first: (call body, reply actually delivered).
+    /// Bodies exist only when the operator enabled body retention.
+    pub fn recent_exchanges(
+        &self,
+        c: &Conversation,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let db = self.db()?;
+        let mut q = db.prepare("SELECT c.body,d.plan FROM call_log c JOIN deliveries d ON d.event_key=c.event_key AND d.phase='final' AND d.status='sent_verified' WHERE c.conversation=? AND c.body IS NOT NULL ORDER BY c.occurred DESC LIMIT ?")?;
+        let mut rows = q
+            .query_map(params![c.key(), limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(body, plan)| {
+                let reply = serde_json::from_str::<Value>(&plan).ok()?["reply"]
+                    .as_str()?
+                    .to_owned();
+                Some((body, reply))
+            })
+            .collect::<Vec<_>>();
+        rows.reverse();
+        Ok(rows)
     }
     pub fn route(&self, c: &Conversation) -> Result<Option<String>> {
         Ok(self

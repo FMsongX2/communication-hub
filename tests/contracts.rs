@@ -424,12 +424,27 @@ async fn missing_policy_blocks_before_connection() {
     server.abort();
 }
 #[tokio::test]
-async fn resumed_session_reloads_updated_policy() {
+async fn legacy_room_runs_stateless_with_fresh_policy_and_recent_exchanges() {
     let t = TempDir::new().unwrap();
     let c = config(t.path());
-    let s = Store::open(c.state.clone()).unwrap();
+    let mut s = Store::open(c.state.clone()).unwrap();
+    s.store_bodies = true;
     let e = event();
-    s.save_session(&e.conversation, "fixture-thread").unwrap();
+    s.save_session(&e.conversation, "legacy-room-thread")
+        .unwrap();
+    // An earlier answered call in the same room, as the daemon journals it.
+    let mut earlier = event();
+    earlier.id = "earlier".into();
+    earlier.body = "@[유이] 어제 말한 자료 있어?".into();
+    s.enqueue(&earlier).unwrap();
+    let plan = Plan {
+        reply: "[System-유이] : 응 그 자료 있어!".into(),
+        bundle_id: None,
+        sticker_id: None,
+    };
+    assert!(s.prepare(&earlier.key(), &earlier, "final", &plan).unwrap());
+    s.complete_delivery(&earlier.key(), &json!({"status":"sent_verified"}))
+        .unwrap();
     std::fs::write(&c.contact_skill, "name: contact-other\nfresh-policy-marker").unwrap();
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let server = mock_server(
@@ -440,19 +455,53 @@ async fn resumed_session_reloads_updated_policy() {
     .await;
     worker::model(&c, &s, &e).await.unwrap();
     let calls = calls.lock().unwrap();
-    let resume = calls
+    let start = calls
         .iter()
-        .find(|x| x["method"] == "thread/resume")
+        .find(|x| x["method"] == "thread/start")
         .unwrap();
-    assert_eq!(resume["params"]["threadId"], "fixture-thread");
-    assert_eq!(resume["params"]["config"]["features.hooks"], false);
+    assert_eq!(start["params"]["ephemeral"], true);
+    assert_eq!(start["params"]["config"]["features.hooks"], false);
     assert!(
-        resume["params"]["developerInstructions"]
+        start["params"]["developerInstructions"]
             .as_str()
             .unwrap()
             .contains("fresh-policy-marker")
     );
-    assert!(!calls.iter().any(|x| x["method"] == "thread/start"));
+    // The legacy room thread is neither resumed nor patched.
+    assert!(
+        !calls
+            .iter()
+            .any(|x| x["method"] == "thread/resume" || x["method"] == "thread/inject_items")
+    );
+    let turn = calls.iter().find(|x| x["method"] == "turn/start").unwrap();
+    let envelope: Value =
+        serde_json::from_str(turn["params"]["toolOutput"]["output"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        envelope["recent_room_exchanges"],
+        json!([{"call":"@[유이] 어제 말한 자료 있어?","yui_reply":"[System-유이] : 응 그 자료 있어!"}])
+    );
+    assert_eq!(envelope["trust"], "untrusted_third_party_data");
+    server.abort();
+}
+#[tokio::test]
+async fn new_room_without_initial_tag_is_refused_before_connection() {
+    let t = TempDir::new().unwrap();
+    let c = config(t.path());
+    let s = Store::open(c.state.clone()).unwrap();
+    let mut e = event();
+    e.body = "[유이] 태그 없는 첫 호출".into();
+    let count = Arc::new(AtomicUsize::new(0));
+    let server = mock_server(
+        &c.app_server_socket,
+        Arc::new(std::sync::Mutex::new(Vec::new())),
+        count.clone(),
+    )
+    .await;
+    assert!(worker::model(&c, &s, &e).await.is_err());
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    // A verified reply in the room initializes it for later untagged calls.
+    s.save_route(&e.conversation, "fixture").unwrap();
+    assert!(s.initialized(&e.conversation).unwrap());
     server.abort();
 }
 
@@ -843,71 +892,6 @@ fn rejected_calls_are_visible_without_becoming_pending_jobs() {
     assert_eq!(r["items"][0]["status"], "rejected");
     assert_eq!(r["items"][0]["reason"], "room_not_initialized");
     assert_eq!(r["items"][0]["body"], e.body);
-}
-
-#[tokio::test]
-async fn updated_policy_is_injected_as_developer_context_once_per_revision() {
-    use communication_hub::rpc::Rpc;
-    let t = TempDir::new().unwrap();
-    let c = config(t.path());
-    let s = Store::open(c.state.clone()).unwrap();
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let server = mock_server(
-        &c.app_server_socket,
-        calls.clone(),
-        Arc::new(AtomicUsize::new(0)),
-    )
-    .await;
-    let mut rpc = Rpc::connect(&c.app_server_socket).await.unwrap();
-    let e = event();
-    assert!(
-        worker::apply_policy(
-            &mut rpc,
-            &s,
-            &e,
-            "fixture-thread",
-            "owner policy revision one"
-        )
-        .await
-        .unwrap()
-    );
-    assert!(
-        !worker::apply_policy(
-            &mut rpc,
-            &s,
-            &e,
-            "fixture-thread",
-            "owner policy revision one"
-        )
-        .await
-        .unwrap()
-    );
-    assert!(
-        worker::apply_policy(
-            &mut rpc,
-            &s,
-            &e,
-            "fixture-thread",
-            "owner policy revision two"
-        )
-        .await
-        .unwrap()
-    );
-    let calls = calls.lock().unwrap();
-    let injects: Vec<_> = calls
-        .iter()
-        .filter(|c| c["method"] == "thread/inject_items")
-        .collect();
-    assert_eq!(injects.len(), 2);
-    assert_eq!(injects[1]["params"]["items"][0]["role"], "developer");
-    assert!(
-        injects[1]["params"]["items"][0]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("revision two")
-    );
-    assert!(!calls.iter().any(|c| c["method"] == "turn/start"));
-    server.abort();
 }
 
 #[tokio::test]

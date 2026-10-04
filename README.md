@@ -63,7 +63,7 @@ communication-hub pause
 communication-hub resume
 ```
 
-Use the installed binary's full path or add its `bin` directory to your PATH. A first KakaoTalk call uses `@[유이]`; initialized conversations accept both `@[유이]` and `[유이]`. Untagged messages do not invoke the model.
+Use the installed binary's full path or add its `bin` directory to your PATH. A first KakaoTalk call uses `@[유이]`; conversations with an earlier binding or a verified reply accept both `@[유이]` and `[유이]`. Untagged messages do not invoke the model.
 
 When sending, the helper rechecks the conversation and trigger, rejects ambiguous names, preserves an existing draft, and verifies a new outgoing bubble. It does not move or click the mouse pointer. It can temporarily bring KakaoTalk forward and send a key to that process. Locked sessions, unavailable Accessibility rows, or ambiguous targets are held.
 
@@ -106,7 +106,7 @@ MIT licensed. OpenKakao-derived notification and AX selection conventions retain
 
 ## Live policy refresh and service tier
 
-Each invocation reloads Contact-Other. When the assembled operator context changes, the hub appends a current developer message through `thread/inject_items` before generation. It preserves prior work history instead of replacing the session; merely passing resume overrides is not treated as proof that a loaded model used the revision. To refresh existing idle bindings without generating or sending messages: `communication-hub pause`, `communication-hub refresh-policy`, then `communication-hub resume`. Active backend turns are not modified.
+Each call is stateless: it runs in a fresh ephemeral backend thread with the current Contact-Other and operator context, so nothing a third party wrote persists in model memory, calls never contend for a room thread, and context does not grow per room. The hub passes the room's last six answered exchanges (call body and the reply actually delivered, each clipped, marked untrusted) only when body retention (`store_body`) is enabled. Bindings from earlier versions remain visible but are no longer resumed. `communication-hub refresh-policy` now only validates the policy file.
 
 `intro_text` optionally controls the deterministic first acknowledgement's introduction. Fixed acknowledgement variants use brief informal Korean. The acknowledgement runs while the model generates instead of before it; with `kakao.prewarm=true`, other calls run a send-free target probe at the same time. The native sender's full chat-list scan proves the room name is unique; a send that finds the room already open reuses that proof only when it came from the same event, name and list size within 90 seconds, and a room opened from the list is always rescanned. Configure `service_tier` (e.g. `"priority"` for a catalog-advertised Fast tier) only when your backend/model supports it. The hub forwards it at both session and turn boundaries, independently of `model` and `effort`. Fast can consume more allowance; a configured tier is not a latency guarantee.
 

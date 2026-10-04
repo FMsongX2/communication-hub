@@ -30,7 +30,7 @@ Replace placeholders with your actual paths and put stdout/stderr logs in a priv
 
 Files under the configured state directory:
 
-- `hub.sqlite3`: queue, scoped sessions/routes, introductions, and delivery journal.
+- `hub.sqlite3`: queue, legacy session bindings, routes, introductions, and delivery journal.
 - `control.json`: persistent pause gate.
 - `source-kakao.json`: source status and observation time.
 - `last-delivery.json`: recent result, including reply text; keep private.

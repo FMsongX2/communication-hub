@@ -278,7 +278,7 @@ fn handle(
 fn ingest(cfg: &Config, store: &Store, event: Event, notify: &Notify) -> Result<Value> {
     cfg.validate_channel(&event.conversation.provider, &event.conversation.account)
         .map_err(|_| Rejected)?;
-    if let Err(reason) = event.validate(now(), store.session(&event.conversation)?.is_some()) {
+    if let Err(reason) = event.validate(now(), store.initialized(&event.conversation)?) {
         if event.body.contains("[유이]") {
             store.record_rejected(&event, &reason.to_string())?;
         }

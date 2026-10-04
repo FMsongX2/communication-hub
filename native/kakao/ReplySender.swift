@@ -32,8 +32,17 @@ func stamp(_ key:String){
 let requestIndex=CommandLine.arguments.firstIndex(of:"--request")
 let requestKey=requestIndex.flatMap{CommandLine.arguments.indices.contains($0+1) ? CommandLine.arguments[$0+1] : nil}
 stamp("started")
+// Kakao is raised to send. Left in front with the room open, it stops posting notifications for
+// that room, so the next call there would never reach the hub; hand focus back when done.
+let previousFrontmost=NSWorkspace.shared.frontmostApplication
+func restoreFrontmost(){
+ guard let previous=previousFrontmost,previous.bundleIdentifier != "com.kakao.KakaoTalkMac",!previous.isTerminated,
+       NSWorkspace.shared.frontmostApplication?.bundleIdentifier=="com.kakao.KakaoTalkMac" else{return}
+ _=previous.activate(options:[])
+}
 func finish(_ status:String,_ reason:String="") -> Never {
  cleanupClipboard?();cleanupClipboard=nil
+ restoreFrontmost()
  var r:[String:Any]=["status":status,"reason":reason]
  if let name=resolvedChatName {r["verified_chat_name"]=name}
  if let target=openTarget {r["open_target"]=target}

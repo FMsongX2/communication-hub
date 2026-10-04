@@ -90,13 +90,8 @@ async fn execute() -> Result<()> {
         Command::Adapters => daemon::request(&cfg.socket, json!({"method":"adapters"})).await?,
         Command::Pause => daemon::request(&cfg.socket, json!({"method":"pause"})).await?,
         Command::Resume => daemon::request(&cfg.socket, json!({"method":"resume"})).await?,
+        // Stateless calls touch no room thread, so a running hub needs no pause for this check.
         Command::RefreshPolicy => {
-            let status = daemon::request(&cfg.socket, json!({"method":"status"})).await?;
-            if status["result"]["processing"] == true
-                || status["result"]["dispatch_enabled"] == true
-            {
-                bail!("pause_hub_before_policy_refresh")
-            }
             worker::refresh_policies(&cfg, &Store::open(cfg.state.clone())?).await?
         }
         Command::Board { open } => {
@@ -151,7 +146,7 @@ async fn execute() -> Result<()> {
             let e = load(&file)?;
             cfg.validate_channel(&e.conversation.provider, &e.conversation.account)?;
             let store = Store::open(cfg.state.clone())?;
-            e.validate(now(), store.session(&e.conversation)?.is_some())?;
+            e.validate(now(), store.initialized(&e.conversation)?)?;
             worker::model(&cfg, &store, &e).await?
         }
         Command::DeliveryCheck {
@@ -172,7 +167,7 @@ async fn execute() -> Result<()> {
             let e = load(&file)?;
             cfg.validate_channel(&e.conversation.provider, &e.conversation.account)?;
             let store = Store::open(cfg.state.clone())?;
-            e.validate(now(), store.session(&e.conversation)?.is_some())?;
+            e.validate(now(), store.initialized(&e.conversation)?)?;
             worker::deliver(
                 &cfg,
                 &store,
