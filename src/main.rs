@@ -64,6 +64,16 @@ enum Command {
         #[arg(long)]
         bundle: String,
     },
+    /// Publish a project's deliberately shareable work snapshot (owner/work-session CLI only).
+    PublishStatus {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Preview exactly the capability facts this event's room will receive; sends nothing.
+    Capabilities {
+        #[arg(long)]
+        file: PathBuf,
+    },
 }
 #[tokio::main(worker_threads = 2)]
 async fn main() {
@@ -185,6 +195,18 @@ async fn execute() -> Result<()> {
         Command::PrepareBundle { file, bundle } => {
             let e = load(&file)?;
             communication_hub::attachments::prepare(&cfg, &e, &e.key(), &bundle)?
+        }
+        Command::PublishStatus { file } => {
+            if std::fs::metadata(&file)?.len() > 32768 {
+                bail!("status_input_too_large")
+            }
+            communication_hub::capabilities::publish_status(
+                &cfg,
+                serde_json::from_slice(&std::fs::read(file)?)?,
+            )?
+        }
+        Command::Capabilities { file } => {
+            communication_hub::capabilities::context(&cfg, &load(&file)?).await?
         }
     };
     println!("{}", serde_json::to_string_pretty(&result)?);

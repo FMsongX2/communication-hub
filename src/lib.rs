@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod attachments;
+pub mod capabilities;
 pub mod claude;
 pub mod config;
 pub mod daemon;

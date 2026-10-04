@@ -15,7 +15,12 @@ var timing:[String:Double]=[:]
 var draftRestored=false
 var textSent=false
 var inputStarted=false
+var sideEffectsStarted=false
+var readOnlyProbe=CommandLine.arguments.contains("--probe-locked") || CommandLine.arguments.contains("--check")
 var attachmentSent=false
+var attachmentSendAttempted=false
+var keyboardEventsPosted=0
+var clipboardCleanupOutcome:String?=nil
 var cleanupClipboard:(()->Void)?=nil
 var openTarget:[String:Any]?=nil
 var attachmentVerification:String?=nil
@@ -38,6 +43,7 @@ stamp("started")
 // that room, so the next call there would never reach the hub; hand focus back when done.
 let previousFrontmost=NSWorkspace.shared.frontmostApplication
 func restoreFrontmost(){
+ guard !lockedTransport,!readOnlyProbe,sessionState()=="unlocked" else{return}
  guard let previous=previousFrontmost,previous.bundleIdentifier != "com.kakao.KakaoTalkMac",!previous.isTerminated,
        NSWorkspace.shared.frontmostApplication?.bundleIdentifier=="com.kakao.KakaoTalkMac" else{return}
  _=previous.activate(options:[])
@@ -46,12 +52,20 @@ func finish(_ status:String,_ reason:String="") -> Never {
  cleanupClipboard?();cleanupClipboard=nil
  restoreFrontmost()
  var r:[String:Any]=["status":status,"reason":reason]
+ if lockedTransport && status=="held" && !inputStarted && !sideEffectsStarted && !textSent && !attachmentSent {
+  r["reason"]="screen_locked";r["native_reason"]=reason
+ }
  if let name=resolvedChatName {r["verified_chat_name"]=name}
  if let target=openTarget {r["open_target"]=target}
  r["timing_seconds"]=timing
  r["draft_restored"]=draftRestored
  r["text_sent"]=textSent
+ r["input_started"]=inputStarted
+ r["side_effects_started"]=sideEffectsStarted
  r["attachment_sent"]=attachmentSent
+ r["attachment_send_attempted"]=attachmentSendAttempted
+ r["keyboard_events_posted"]=keyboardEventsPosted
+ if let outcome=clipboardCleanupOutcome {r["clipboard_cleanup"]=outcome}
  if let check=attachmentVerification {r["attachment_verification"]=check}
  if let rows=listRows {r["list_rows"]=rows}
  if let rooms=listedRooms {r["rooms"]=rooms}
@@ -67,6 +81,18 @@ func finish(_ status:String,_ reason:String="") -> Never {
 }
 func attr(_ e:AXUIElement,_ key:String)->CFTypeRef? {var v:CFTypeRef?;guard AXUIElementCopyAttributeValue(e,key as CFString,&v) == .success else{return nil};return v}
 func str(_ e:AXUIElement,_ key:String)->String {attr(e,key) as? String ?? ""}
+func actionNames(_ e:AXUIElement)->[String] {
+ var names:CFArray?;guard AXUIElementCopyActionNames(e,&names) == .success else{return []}
+ return names as? [String] ?? []
+}
+func sessionState()->String {
+ guard let s=CGSessionCopyCurrentDictionary() as? [String:Any] else{return "unknown"}
+ guard let owner=s[kCGSessionUserIDKey] as? NSNumber,owner.uint32Value==getuid() else{return "inactive"}
+ if s["CGSSessionScreenIsLocked"] as? Bool == true {return "locked"}
+ guard s[kCGSessionOnConsoleKey] as? Bool == true else{return "inactive"}
+ return "unlocked"
+}
+var lockedTransport=false
 func children(_ e:AXUIElement)->[AXUIElement] {attr(e,kAXChildrenAttribute) as? [AXUIElement] ?? []}
 struct Node {
  let element:AXUIElement
@@ -160,6 +186,27 @@ func kakaoRoot()->AXUIElement? {
  let running=NSRunningApplication.runningApplications(withBundleIdentifier:"com.kakao.KakaoTalkMac")
  return running.count==1 ? AXUIElementCreateApplication(running[0].processIdentifier) : nil
 }
+// Read metadata only: never read AXValue of a login/password input. A unique login button and
+// secure text-field subrole in Kakao's own window prove its login UI; missing AX data is unknown.
+func kakaoReadiness()->String {
+ let apps=NSRunningApplication.runningApplications(withBundleIdentifier:"com.kakao.KakaoTalkMac")
+ if apps.isEmpty{return "not_running"}
+ guard apps.count==1 else{return "unknown"}
+ let root=AXUIElementCreateApplication(apps[0].processIdentifier)
+ let wins=attr(root,kAXWindowsAttribute) as? [AXUIElement] ?? []
+ guard wins.count==1 else{return "available_or_unknown"}
+ var count=0,loginButtons=0,secureFields=0,composers=0
+ func scan(_ e:AXUIElement,_ depth:Int){
+  guard depth<16,count<2000 else{return};count+=1
+  let role=str(e,kAXRoleAttribute),title=str(e,kAXTitleAttribute),description=str(e,kAXDescriptionAttribute)
+  if role==kAXButtonRole && (title=="로그인" || description=="로그인" || title=="Log in" || description=="Log in") {loginButtons+=1}
+  if role==kAXTextFieldRole && str(e,kAXSubroleAttribute)=="AXSecureTextField" {secureFields+=1}
+  if role==kAXTextAreaRole && (title=="메시지 입력" || description=="메시지 입력") {composers+=1}
+  for child in children(e){scan(child,depth+1)}
+ }
+ scan(wins[0],0)
+ return loginButtons==1 && secureFields==1 && composers==0 ? "login_required":"available_or_unknown"
+}
 // Structure only: message text is reduced to its shape unless it is hub traffic (a tag or a reply).
 func probeShape(_ s:String)->String {
  if s.isEmpty {return ""}
@@ -197,9 +244,10 @@ func isSpacer(_ row:AXUIElement)->Bool {collect(row).allSatisfy{$0.role==kAXRowR
 func recentTagged(_ rows:[AXUIElement])->Set<String> {Set(rows.suffix(30).flatMap(taggedMessages))}
 func watchTick() {
  undelivered=undelivered.compactMap{entry in sendToHub(entry.item) || entry.attempts>=20 ? nil : (entry.item,entry.attempts+1)}
- let front=NSWorkspace.shared.frontmostApplication?.bundleIdentifier=="com.kakao.KakaoTalkMac"
+ let session=sessionState()
+ let front=session=="unlocked" && NSWorkspace.shared.frontmostApplication?.bundleIdentifier=="com.kakao.KakaoTalkMac"
  if Date().timeIntervalSince(lastWatchStatusAt)>=5 {
-  if sendToHub(["kind":"open_room_status","status":front ? "watching_focused_room":"kakao_in_background","at":Date().timeIntervalSince1970]) {lastWatchStatusAt=Date()}
+  if sendToHub(["kind":"open_room_status","status":session=="unlocked" ? (front ? "watching_focused_room":"kakao_in_background") : "session_"+session,"at":Date().timeIntervalSince1970]) {lastWatchStatusAt=Date()}
  }
  guard front,let root=kakaoRoot(),let window=elementOrNil(attr(root,kAXFocusedWindowAttribute)) else{watched=nil;return}
  let title=str(window,kAXTitleAttribute)
@@ -263,29 +311,73 @@ func requireUnexpired(){
  if let deadline=p["expires_at"] as? Double,Date().timeIntervalSince1970>deadline{finish(textSent ? "partial_file_held":(inputStarted ? "sending":"held"),"request_expired")}
 }
 requireUnexpired()
-if let session=CGSessionCopyCurrentDictionary() as? [String:Any],session["CGSSessionScreenIsLocked"] as? Bool == true {finish("held","screen_locked")}
+let state=sessionState()
+if p["session_probe"] as? Bool == true {
+ readOnlyProbe=true
+ openTarget=["session_state":state,"kakao_status":kakaoReadiness(),"read_only":true,"keyboard_events_posted":false,"clipboard_accessed":false]
+ finish("ready","session_probe")
+}
+let lockedProbe=CommandLine.arguments.contains("--probe-locked") || p["probe_locked"] as? Bool == true
+if lockedProbe {readOnlyProbe=true}
+lockedTransport=state=="locked" && p["locked_ax_text"] as? Bool == true
+if !lockedProbe {
+ if state=="locked" && !lockedTransport {finish("held","screen_locked")}
+ if state=="inactive" {finish("held","console_session_inactive")}
+ if state=="unknown" {finish("held","console_session_state_unknown")}
+ // No public AX file-paste action is proven. Preserve the whole final plan until unlock;
+ // do not send its text first and then pretend an attachment was delivered.
+ if lockedTransport && (p["attachment_path"] != nil || phase=="attachment_only") {finish("held","screen_locked")}
+}
 let apps=NSRunningApplication.runningApplications(withBundleIdentifier:"com.kakao.KakaoTalkMac")
 guard apps.count==1 else{finish("held","kakao_not_running_or_ambiguous")}
 let app=apps[0],root=AXUIElementCreateApplication(app.processIdentifier)
+if kakaoReadiness()=="login_required" {finish("held","kakao_login_required")}
 func postKeyboardKey(_ keyCode:CGKeyCode,_ flags:CGEventFlags=[]) -> Bool {
+ guard !lockedTransport,sessionState()=="unlocked" else{return false}
  guard let down=CGEvent(keyboardEventSource:nil,virtualKey:keyCode,keyDown:true),let up=CGEvent(keyboardEventSource:nil,virtualKey:keyCode,keyDown:false) else{return false}
  down.flags=flags;up.flags=flags
- down.postToPid(app.processIdentifier);Thread.sleep(forTimeInterval:0.03);up.postToPid(app.processIdentifier)
+ guard sessionState()=="unlocked" else{return false}
+ down.postToPid(app.processIdentifier);keyboardEventsPosted+=1
+ Thread.sleep(forTimeInterval:0.03)
+ // A down event may already have executed. Stop on a lock transition and let the caller
+ // record uncertainty; never emit another event into an inactive/locked GUI session.
+ guard sessionState()=="unlocked" else{return false}
+ up.postToPid(app.processIdentifier);keyboardEventsPosted+=1
  return true
 }
+func requireUnlockedUI(_ location:String){
+ guard !lockedTransport,sessionState()=="unlocked" else{
+  finish(attachmentSendAttempted || (inputStarted && !textSent) ? "sending":(textSent ? "partial_file_held":"held"),"session_changed_"+location)
+ }
+}
 func windowList()->[AXUIElement] {attr(root,kAXWindowsAttribute) as? [AXUIElement] ?? []}
+if lockedProbe {
+ let wins=windowList(),named=wins.filter{str($0,kAXTitleAttribute)==name && name != "카카오톡" && name != "KakaoTalk"}
+ let nodes=named.count==1 ? collectWithTrigger(named[0],trigger) : []
+ let editors=nodes.filter{$0.isComposer},sends=nodes.filter{$0.isSend}
+ var settable=DarwinBoolean(false)
+ let canSet=editors.count==1 && AXUIElementIsAttributeSettable(editors[0].element,kAXValueAttribute as CFString,&settable) == .success && settable.boolValue
+ openTarget=["session_state":state,"read_only":true,"keyboard_events_posted":false,"clipboard_accessed":false,
+  "matching_windows":named.count,"trigger_present":nodes.contains{$0.value==trigger},"composer_count":editors.count,
+  "draft_empty":editors.count==1 && editors[0].value.isEmpty,"composer_value_settable":canSet,
+  "send_button_count":sends.count,"send_button_enabled":sends.count==1 && sends[0].enabled,
+  "send_action_names":sends.count==1 ? actionNames(sends[0].element) : [],
+  "locked_text_candidate":state=="locked" && named.count==1 && nodes.contains{$0.value==trigger} && canSet && editors[0].value.isEmpty && sends.count==1 && actionNames(sends[0].element).contains(kAXPressAction),
+  "locked_attachment_supported":false]
+ openTarget?["requires_complete_unique_chat_list"]=true
+ finish("ready","locked_ax_read_only_probe")
+}
 if p["probe"] as? Bool == true && p["inspect_windows"] as? Bool == true {
  openTarget=["window_titles":windowList().map{str($0,kAXTitleAttribute)}]
  finish("ready")
 }
 // Kakao advertises Cmd+2 for its chat list. Address only its process, never
 // the user's global keyboard, and verify the resulting main window.
-if !windowList().contains(where:{str($0,kAXTitleAttribute)=="카카오톡"}) {
+if !lockedTransport && !windowList().contains(where:{str($0,kAXTitleAttribute)=="카카오톡"}) {
+ requireUnlockedUI("before_chat_list_activation")
+ sideEffectsStarted=true
  _=app.activate(options:[])
- if let down=CGEvent(keyboardEventSource:nil,virtualKey:19,keyDown:true),let up=CGEvent(keyboardEventSource:nil,virtualKey:19,keyDown:false){
-  down.flags = .maskCommand;up.flags = .maskCommand
-  down.postToPid(app.processIdentifier);Thread.sleep(forTimeInterval:0.03);up.postToPid(app.processIdentifier)
- }
+ guard postKeyboardKey(19,.maskCommand) else{finish("held","chat_list_key_session_or_event_failed")}
  let deadline=Date().addingTimeInterval(1)
  while Date()<deadline && !windowList().contains(where:{str($0,kAXTitleAttribute)=="카카오톡"}){Thread.sleep(forTimeInterval:0.05)}
 }
@@ -298,7 +390,7 @@ func labelMatches(_ text:String,_ expected:String)->Bool {
 func findCandidates()->[(AXUIElement,[Node])] {
  let wins=windowList(),named=wins.filter{str($0,kAXTitleAttribute)==name}
  if named.count>1 {finish("held","duplicate_named_windows")}
- let scope=(p["room_name_verified"] as? Bool == true) ? named : wins
+ let scope=((p["room_name_verified"] as? Bool == true) ? named : wins).filter{str($0,kAXTitleAttribute) != "카카오톡" && str($0,kAXTitleAttribute) != "KakaoTalk"}
  var found:[(AXUIElement,[Node])]=[]
  for window in scope {
   let tree=collectWithTrigger(window,trigger)
@@ -314,7 +406,7 @@ var openedFromList=false
 // event runs it moments earlier, so a send that found the room already open may reuse that proof
 // when the name, trigger, list size and strictness all match within 90 seconds.
 func reusableListScan(_ actualName:String,_ rowCount:Int)->Bool {
- guard !openedFromList,let data=try? Data(contentsOf:listScanURL),
+ guard !lockedTransport,p["resumed_locked"] as? Bool != true,!openedFromList,let data=try? Data(contentsOf:listScanURL),
        let c=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any],
        c["chat_name"] as? String==actualName,c["trigger_sha256"] as? String==triggerDigest,c["rows"] as? Int==rowCount,
        c["room_name_verified"] as? Bool==false || c["room_name_verified"] as? Bool==roomNameVerified,
@@ -331,7 +423,7 @@ func verifyListTarget(_ actualName:String){
  listRows=rows.count
  // An owner-approved room was proven unique at this list size; unchanged size means no room was
  // added or removed since, so the per-call scan is skipped.
- if let expected=p["room_verified_rows"] as? Int,expected==rows.count {stamp("room_registry_verified");return}
+ if !lockedTransport,p["resumed_locked"] as? Bool != true,let expected=p["room_verified_rows"] as? Int,expected==rows.count {stamp("room_registry_verified");return}
  if reusableListScan(actualName,rows.count) {stamp("list_scan_reused");return}
  let matching=rows.filter{row in collect(row).contains{node in node.role==kAXStaticTextRole && [node.value,node.title,node.description].contains{labelMatches($0,actualName)}}}
  guard matching.count==1 else{finish("held","duplicate_or_missing_chat_name")}
@@ -373,11 +465,13 @@ if p["verify_room"] as? Bool == true {
  finish("ready","room_name_unique")
 }
 if p["probe"] as? Bool == true && p["close_probe"] as? Bool == true {
+ if lockedTransport {finish("held","locked_ax_close_probe_not_allowed")}
  let target=windowList().filter{str($0,kAXTitleAttribute)==name}
  guard target.count==1 else{finish("held","close_probe_target_ambiguous")}
  let editors=collect(target[0]).filter{$0.isComposer}
  guard editors.count==1 && editors[0].value.isEmpty else{finish("held","close_probe_draft_present")}
  guard let button=attr(target[0],kAXCloseButtonAttribute),CFGetTypeID(button)==AXUIElementGetTypeID() else{finish("held","close_probe_button_missing")}
+ requireUnlockedUI("before_close_probe")
  _=AXUIElementPerformAction(button as! AXUIElement,kAXPressAction as CFString)
  let deadline=Date().addingTimeInterval(2)
  while Date()<deadline {
@@ -388,6 +482,8 @@ if p["probe"] as? Bool == true && p["close_probe"] as? Bool == true {
 }
 var candidates=findCandidates()
 if candidates.isEmpty {
+ if lockedTransport {finish("held","locked_ax_target_not_already_open")}
+ sideEffectsStarted=true
  openedFromList=true
  let main=windowList().filter{str($0,kAXTitleAttribute)=="카카오톡"}
  guard main.count==1 else{finish("held","chat_list_window_missing_or_ambiguous")}
@@ -408,8 +504,10 @@ if candidates.isEmpty {
  let tables=collect(main[0]).filter{$0.role==kAXTableRole}
  guard tables.count==1 else{finish("held","chat_list_table_ambiguous")}
  let table=tables[0].element
+ requireUnlockedUI("before_chat_row_selection")
  guard AXUIElementSetAttributeValue(table,"AXSelectedRows" as CFString,[row] as CFArray) == .success else{finish("held","chat_row_selection_failed")}
  guard let selected=attr(table,"AXSelectedRows") as? [AXUIElement],selected.count==1,CFEqual(selected[0],row) else{finish("held","chat_row_selection_not_verified")}
+ requireUnlockedUI("before_chat_list_focus")
  _=AXUIElementSetAttributeValue(table,kAXFocusedAttribute as CFString,kCFBooleanTrue)
  func actions(_ element:AXUIElement)->[String] {
   var names:CFArray?;guard AXUIElementCopyActionNames(element,&names) == .success else{return []}
@@ -417,13 +515,16 @@ if candidates.isEmpty {
  }
  let rowActions=actions(row),tableActions=actions(table)
  let opened:AXError
+ requireUnlockedUI("before_chat_row_open_action")
  if rowActions.contains(kAXPressAction) {opened=AXUIElementPerformAction(row,kAXPressAction as CFString)}
  else if rowActions.contains("AXConfirm") {opened=AXUIElementPerformAction(row,"AXConfirm" as CFString)}
  else if tableActions.contains("AXConfirm") {opened=AXUIElementPerformAction(table,"AXConfirm" as CFString)}
  else{
   // AX supplies and rechecks the target for a pointer-free open;
   // no screenshot, external desktop server or untrusted command is involved.
+  requireUnlockedUI("before_chat_open_activation")
   _=app.activate(options:[])
+  requireUnlockedUI("before_chat_open_raise")
   guard AXUIElementPerformAction(main[0],kAXRaiseAction as CFString) == .success else{finish("held","chat_list_raise_failed")}
   _=AXUIElementSetAttributeValue(main[0],kAXMainAttribute as CFString,kCFBooleanTrue)
   let focusDeadline=Date().addingTimeInterval(1)
@@ -443,12 +544,12 @@ if candidates.isEmpty {
   guard stillMatches else{finish("held","chat_row_content_changed")}
   // Open only via a key addressed to Kakao's verified chat-list focus.
   // Never post mouse events or send a global keyboard event.
+  requireUnlockedUI("before_chat_open_key_focus")
   guard AXUIElementSetAttributeValue(table,kAXFocusedAttribute as CFString,kCFBooleanTrue) == .success,
         let focusedElement=attr(root,kAXFocusedUIElementAttribute),CFGetTypeID(focusedElement)==AXUIElementGetTypeID(),
         (CFEqual(focusedElement,table) || freshRow.contains(where:{CFEqual($0.element,focusedElement)})) else{finish("held","chat_list_keyboard_focus_not_verified")}
   let pointerBefore=CGEvent(source:nil)?.location
-  guard let down=CGEvent(keyboardEventSource:nil,virtualKey:36,keyDown:true),let up=CGEvent(keyboardEventSource:nil,virtualKey:36,keyDown:false) else{finish("held","keyboard_event_creation_failed")}
-  down.postToPid(app.processIdentifier);Thread.sleep(forTimeInterval:0.03);up.postToPid(app.processIdentifier)
+  guard postKeyboardKey(36) else{finish("held","chat_open_key_session_or_event_failed")}
   stamp("scoped_keyboard_open_completed")
   let pointerAfter=CGEvent(source:nil)?.location
   openTarget=["transport":"pid_keyboard","mouse_events_posted":false,"pointer_same_at_observation":pointerBefore==pointerAfter]
@@ -475,6 +576,7 @@ let editors=nodes.filter{$0.isComposer}
 guard editors.count==1 else{finish("held","composer_ambiguous")}
 let editor=editors[0].element
 let originalDraft=str(editor,kAXValueAttribute)
+if lockedTransport && !originalDraft.isEmpty {finish("held","locked_ax_draft_present")}
 func sameVerifiedRoom(_ expectedDraft:String)->Bool {
  let named=windowList().filter{str($0,kAXTitleAttribute)==actualName}
  guard named.count==1,CFEqual(named[0],win),str(win,kAXTitleAttribute)==actualName else{return false}
@@ -498,6 +600,7 @@ if !originalDraft.isEmpty {
  } catch {finish("held","draft_backup_failed")}
 }
 func restoreDraft(){
+ if !originalDraft.isEmpty && sessionState() != "unlocked" {return}
  // Never replace text typed by the owner while delivery was being verified.
  if str(win,kAXTitleAttribute)==actualName && str(editor,kAXValueAttribute).isEmpty {
   if originalDraft.isEmpty {draftRestored=true}
@@ -517,7 +620,7 @@ func performAttachment(_ path:String){
  else if suffix=="png",header.starts(with:[0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]) {kind="image"}
  else if suffix=="gif" && (header.prefix(6)==Data("GIF87a".utf8) || header.prefix(6)==Data("GIF89a".utf8)) {kind="image"}
  else {finish("partial_file_held","attachment_type_or_signature_unsupported")}
- if let session=CGSessionCopyCurrentDictionary() as? [String:Any],session["CGSSessionScreenIsLocked"] as? Bool == true {finish("partial_file_held","screen_locked")}
+ requireUnlockedUI("before_attachment")
  guard sameVerifiedRoom(originalDraft) else{finish("partial_file_held","target_changed_before_attachment")}
  func filenameMarkerCount()->Int {
   collect(win).filter{node in
@@ -535,34 +638,52 @@ func performAttachment(_ path:String){
   return hasName && hasSend
  }
  let beforeMarkers=kind=="zip" ? filenameMarkerCount():0
+ requireUnlockedUI("before_clipboard_read")
  let clipboard=NSPasteboard.general
+ let clipboardSessionUID=(CGSessionCopyCurrentDictionary() as? [String:Any])?[kCGSessionUserIDKey] as? NSNumber
  let saved=clipboard.pasteboardItems?.map{item in
   item.types.reduce(into:[NSPasteboard.PasteboardType:Data]()){result,type in
    if let data=item.data(forType:type){result[type]=data}
   }
  } ?? []
- clipboard.clearContents()
- guard clipboard.writeObjects([file as NSURL]) else{finish("partial_file_held","file_clipboard_failed")}
- let ownClipboardVersion=clipboard.changeCount
+ var ownClipboardVersion=clipboard.changeCount
  cleanupClipboard = {
-  if clipboard.changeCount==ownClipboardVersion {
-   clipboard.clearContents()
+  guard sessionState()=="unlocked",let owner=clipboardSessionUID,
+        owner.uint32Value==getuid(),
+        ((CGSessionCopyCurrentDictionary() as? [String:Any])?[kCGSessionUserIDKey] as? NSNumber)==owner else{
+   clipboardCleanupOutcome="skipped_session_not_unlocked_or_owner_changed";return
+  }
+  guard clipboard.changeCount==ownClipboardVersion else{clipboardCleanupOutcome="skipped_clipboard_changed";return}
    let items=saved.map{values -> NSPasteboardItem in
     let item=NSPasteboardItem();for (type,data) in values{item.setData(data,forType:type)};return item
    }
-   clipboard.writeObjects(items)
-  }
+   // Recheck after building the saved items; never restore a clipboard in another session.
+   guard sessionState()=="unlocked",clipboard.changeCount==ownClipboardVersion else{clipboardCleanupOutcome="skipped_cleanup_boundary_changed";return}
+   clipboard.clearContents()
+   guard sessionState()=="unlocked" else{clipboardCleanupOutcome="skipped_locked_after_cleanup_clear";return}
+   clipboardCleanupOutcome=clipboard.writeObjects(items) ? "restored_same_owner_unchanged_clipboard":"restore_failed"
  }
  defer {cleanupClipboard?();cleanupClipboard=nil}
+ requireUnlockedUI("before_clipboard_clear")
+ sideEffectsStarted=true
+ clipboard.clearContents();ownClipboardVersion=clipboard.changeCount
+ requireUnlockedUI("before_clipboard_write")
+ guard clipboard.writeObjects([file as NSURL]) else{finish("partial_file_held","file_clipboard_failed")}
+ ownClipboardVersion=clipboard.changeCount
+ requireUnlockedUI("before_attachment_raise")
  _=AXUIElementPerformAction(win,kAXRaiseAction as CFString)
+ requireUnlockedUI("before_attachment_activation")
  _=app.activate(options:[])
+ requireUnlockedUI("before_attachment_focus")
  _=AXUIElementSetAttributeValue(editor,kAXFocusedAttribute as CFString,kCFBooleanTrue)
  guard let focused=attr(root,kAXFocusedUIElementAttribute),CFEqual(focused,editor),sameVerifiedRoom(originalDraft) else{finish("partial_file_held","attachment_focus_not_verified")}
+ requireUnlockedUI("before_attachment_paste")
  guard postKeyboardKey(9,.maskCommand) else{finish("partial_file_held","attachment_paste_key_creation_failed")}
  let previewDeadline=Date().addingTimeInterval(8)
  var uploadButton:AXUIElement?=nil
  while Date()<previewDeadline {
   Thread.sleep(forTimeInterval:0.1)
+  requireUnlockedUI("during_attachment_preview")
   let sheets=attr(win,"AXSheets") as? [AXUIElement] ?? []
   let previewNodes:[Node]=sheets.isEmpty ? collect(win,visibleRowsOnly:true) : sheets.flatMap{collect($0)}
   if previewNodes.contains(where:{($0.value+$0.title+$0.description).contains(file.lastPathComponent)}) {
@@ -571,11 +692,14 @@ func performAttachment(_ path:String){
   }
  }
  guard let upload=uploadButton,str(win,kAXTitleAttribute)==actualName,sameVerifiedRoom(originalDraft) else{finish("partial_file_held","attachment_preview_not_verified")}
+ requireUnlockedUI("before_attachment_send_focus")
  guard AXUIElementSetAttributeValue(upload,kAXFocusedAttribute as CFString,kCFBooleanTrue) == .success,
        let sendFocused=attr(root,kAXFocusedUIElementAttribute),CFEqual(sendFocused,upload),
        str(win,kAXTitleAttribute)==actualName,sameVerifiedRoom(originalDraft) else{finish("partial_file_held","attachment_enter_focus_not_verified")}
  stamp("before_attachment_send")
  requireUnexpired()
+ requireUnlockedUI("before_attachment_send")
+ attachmentSendAttempted=true
  guard postKeyboardKey(36) else{finish("sending","attachment_enter_outcome_uncertain")}
  if kind=="image" {
   // Kakao image bubbles expose no filename and bubble geometry proved unreliable. Enter was
@@ -584,6 +708,7 @@ func performAttachment(_ path:String){
   let imageDeadline=Date().addingTimeInterval(6)
   while Date()<imageDeadline {
    Thread.sleep(forTimeInterval:0.1)
+   requireUnlockedUI("after_attachment_send")
    let named=windowList().filter{str($0,kAXTitleAttribute)==actualName}
    if named.count==1 && CFEqual(named[0],win) && !uploadPreviewVisible() {
     attachmentSent=true;attachmentVerification="upload_sheet_closed";stamp("attachment_verified");return
@@ -594,6 +719,7 @@ func performAttachment(_ path:String){
  let deadline=Date().addingTimeInterval(35)
  while Date()<deadline {
   Thread.sleep(forTimeInterval:0.15)
+  requireUnlockedUI("after_attachment_send")
   if str(win,kAXTitleAttribute)==actualName && sameVerifiedRoom(originalDraft) && !uploadPreviewVisible() && filenameMarkerCount()>beforeMarkers {
    attachmentSent=true;stamp("attachment_verified");return
   }
@@ -608,24 +734,51 @@ if phase=="attachment_only" {
  performAttachment(path)
  finish("sent_verified","")
 }
-_=AXUIElementPerformAction(win,kAXRaiseAction as CFString)
-_=app.activate(options:[])
+if lockedTransport {
+ let buttons=collect(win,visibleRowsOnly:true).filter{$0.isSend}
+ guard buttons.count==1,actionNames(buttons[0].element).contains(kAXPressAction) else{finish("held","locked_ax_bound_send_unsupported")}
+ var settable=DarwinBoolean(false)
+ guard AXUIElementIsAttributeSettable(editor,kAXValueAttribute as CFString,&settable) == .success,settable.boolValue else{finish("held","locked_ax_value_not_settable")}
+} else {
+ guard sessionState()=="unlocked" else{finish("held","screen_locked")}
+ sideEffectsStarted=true
+ _=AXUIElementPerformAction(win,kAXRaiseAction as CFString)
+ requireUnlockedUI("before_text_activation")
+ _=app.activate(options:[])
+}
 guard sameVerifiedRoom(originalDraft) else{finish("held","target_or_draft_changed_before_write")}
 requireUnexpired()
 stamp("before_input")
+guard sessionState()==(lockedTransport ? "locked":"unlocked") else{finish("held","session_changed_before_input")}
 inputStarted=true
+sideEffectsStarted=true
 guard AXUIElementSetAttributeValue(editor,kAXValueAttribute as CFString,reply as CFString) == .success else{finish("sending","composer_write_outcome_uncertain")}
 guard str(win,kAXTitleAttribute)==actualName,str(editor,kAXValueAttribute)==reply else{finish("sending","composer_changed_after_write")}
-guard AXUIElementSetAttributeValue(editor,kAXFocusedAttribute as CFString,kCFBooleanTrue) == .success,
+if !lockedTransport {
+ requireUnlockedUI("before_text_focus")
+ guard AXUIElementSetAttributeValue(editor,kAXFocusedAttribute as CFString,kCFBooleanTrue) == .success,
       let textFocused=attr(root,kAXFocusedUIElementAttribute),CFEqual(textFocused,editor),
       str(editor,kAXValueAttribute)==reply,sameVerifiedRoom(reply) else{finish("sending","composer_focus_or_target_changed")}
+}
 // Own sends scroll the room to the bottom, so the new bubble is among the visible rows; counting
 // only those keeps each check cheap while Kakao is busy right after Enter.
 func visibleReplyCount()->Int {collect(win,visibleRowsOnly:true).filter{$0.value==reply && !$0.isComposer}.count}
 let before=visibleReplyCount()
 stamp("before_send")
 requireUnexpired()
-guard postKeyboardKey(36) else{finish("sending","text_enter_event_creation_failed")}
+guard sessionState()==(lockedTransport ? "locked":"unlocked") else{finish("sending","session_changed_after_input")}
+if lockedTransport {
+ // Bound fresh button action, never focused keyboard/clipboard/global activation. Even
+ // CannotComplete can have executed the action, so every error here remains uncertain.
+ let buttons=collect(win,visibleRowsOnly:true).filter{$0.isSend && $0.enabled}
+ guard buttons.count==1,sameVerifiedRoom(reply),actionNames(buttons[0].element).contains(kAXPressAction) else{finish("sending","locked_ax_send_target_changed_after_input")}
+ guard sessionState()=="locked" else{finish("sending","session_changed_before_locked_axpress")}
+ let outcome=AXUIElementPerformAction(buttons[0].element,kAXPressAction as CFString)
+ openTarget=["transport":"locked_bound_axpress","mouse_events_posted":false,"keyboard_events_posted":false,"clipboard_accessed":false,"action_result":outcome.rawValue]
+ guard outcome == .success else{finish("sending","locked_ax_send_action_outcome_uncertain")}
+} else {
+ guard postKeyboardKey(36) else{finish("sending","text_enter_event_creation_failed")}
+}
 let sentDeadline=Date().addingTimeInterval(8)
 while Date()<sentDeadline {
  Thread.sleep(forTimeInterval:0.05)

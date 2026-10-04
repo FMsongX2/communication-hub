@@ -36,6 +36,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS agent_intro(conversation TEXT NOT NULL,agent TEXT NOT NULL,PRIMARY KEY(conversation,agent));
             CREATE TABLE IF NOT EXISTS rooms(conversation TEXT PRIMARY KEY,title TEXT NOT NULL,approved REAL,yui INTEGER NOT NULL DEFAULT 1,yumi INTEGER NOT NULL DEFAULT 1,verified_rows INTEGER,verified_at REAL,seen REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS delivery_inputs(delivery TEXT PRIMARY KEY,payload TEXT NOT NULL,created REAL NOT NULL,expires REAL,next_attempt REAL NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS message_sources(conversation TEXT NOT NULL,digest TEXT NOT NULL,source TEXT NOT NULL,occurred REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS message_sources_room ON message_sources(conversation,digest);")?;
         // Rooms already answered in (a verified name) were in use before the registry existed.
@@ -110,12 +111,12 @@ impl Store {
     /// The owner-approved room registry. A room appears here (unapproved) on its first call.
     pub fn room(&self, c: &Conversation) -> Result<Option<Value>> {
         Ok(self.db()?.query_row(
-            "SELECT title,approved,yui,yumi,verified_rows,verified_at FROM rooms WHERE conversation=?",
+            "SELECT title,approved,yui,yumi,verified_rows,verified_at,context_reset_at FROM rooms WHERE conversation=?",
             [c.key()],
             |r| {
                 Ok(json!({"title":r.get::<_,String>(0)?,"approved":r.get::<_,Option<f64>>(1)?.is_some(),
                     "yui":r.get::<_,i64>(2)?!=0,"yumi":r.get::<_,i64>(3)?!=0,
-                    "verified_rows":r.get::<_,Option<i64>>(4)?,"verified_at":r.get::<_,Option<f64>>(5)?}))
+                    "verified_rows":r.get::<_,Option<i64>>(4)?,"verified_at":r.get::<_,Option<f64>>(5)?,"context_reset_at":r.get::<_,Option<f64>>(6)?}))
             },
         ).optional()?)
     }
@@ -476,10 +477,20 @@ impl Store {
         Ok(())
     }
     pub fn prepare(&self, key: &str, e: &Event, phase: &str, p: &Plan) -> Result<bool> {
-        Ok(self.db()?.execute(
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let inserted = tx.execute(
             "INSERT OR IGNORE INTO deliveries VALUES(?,?,?,?,'prepared',NULL)",
             params![key, e.key(), phase, serde_json::to_string(p)?],
-        )? == 1)
+        )? == 1;
+        if inserted {
+            tx.execute(
+                "INSERT INTO delivery_inputs(delivery,payload,created) VALUES(?,?,?)",
+                params![key, serde_json::to_string(e)?, now()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(inserted)
     }
     pub fn has_delivery(&self, key: &str) -> Result<bool> {
         Ok(self
@@ -494,15 +505,144 @@ impl Store {
         )? == 1)
     }
     pub fn complete_delivery(&self, key: &str, r: &Value) -> Result<()> {
-        self.db()?.execute(
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Only the initial, explicit lock rejection certifies zero external input. Neither
+        // an AX timeout nor a stale phase file can establish this property.
+        let defer = r["status"] == "held"
+            && r["defer_locked_delivery"] == true
+            && matches!(
+                r["reason"].as_str(),
+                Some("screen_locked" | "console_session_inactive")
+            )
+            && r["input_started"] == false
+            && r["text_sent"] == false
+            && r["attachment_sent"] == false
+            && r["side_effects_started"] == false
+            && r["retry_deadline"]
+                .as_f64()
+                .is_some_and(|d| d.is_finite() && d > now())
+            && tx
+                .query_row(
+                    "SELECT phase='final' FROM deliveries WHERE key=?",
+                    [key],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+        let mut receipt = r.clone();
+        if defer {
+            receipt["status"] = json!("lock_deferred");
+            receipt["lock_origin_reason"] = r["reason"].clone();
+        }
+        tx.execute(
             "UPDATE deliveries SET status=?,receipt=? WHERE key=?",
             params![
-                r["status"].as_str().unwrap_or("sending_uncertain"),
-                serde_json::to_string(r)?,
+                receipt["status"].as_str().unwrap_or("sending_uncertain"),
+                serde_json::to_string(&receipt)?,
                 key
             ],
         )?;
+        if defer {
+            tx.execute("UPDATE delivery_inputs SET expires=COALESCE(expires,?1),next_attempt=?2 WHERE delivery=?3",params![r["retry_deadline"].as_f64(), now()+30.0,key])?;
+            tx.execute(
+                "DELETE FROM expression_history WHERE delivery=? AND verified=0",
+                [key],
+            )?;
+        } else {
+            tx.execute("DELETE FROM delivery_inputs WHERE delivery=?", [key])?;
+        }
+        tx.commit()?;
         Ok(())
+    }
+    /// Atomically leases a saved final reply, never a model call. Crash recovery marks its
+    /// `sending` lease uncertain; it must not be leased again without operator inspection.
+    pub fn claim_deferred_delivery(&self, at: f64) -> Result<Option<(String, Event, Plan)>> {
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("UPDATE deliveries SET status='held',receipt=json_object('status','held','reason','deferred_delivery_expired') WHERE status='lock_deferred' AND key IN (SELECT delivery FROM delivery_inputs WHERE expires<=?1)",[at])?;
+        tx.execute("UPDATE events SET status='held',reason='deferred_delivery_expired',updated=?1 WHERE key IN (SELECT event_key FROM deliveries WHERE receipt LIKE '%deferred_delivery_expired%')",[at])?;
+        tx.execute("DELETE FROM delivery_inputs WHERE delivery IN (SELECT key FROM deliveries WHERE status NOT IN ('lock_deferred','sending','prepared'))",[])?;
+        let row:Option<(String,String,String)>=tx.query_row("SELECT d.key,i.payload,d.plan FROM deliveries d JOIN delivery_inputs i ON i.delivery=d.key WHERE d.status='lock_deferred' AND i.expires>?1 AND i.next_attempt<=?1 ORDER BY i.created,d.rowid LIMIT 1",[at],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        if let Some((key, event, plan)) = row {
+            let event: Event = serde_json::from_str(&event)?;
+            let plan: Plan = serde_json::from_str(&plan)?;
+            tx.execute("UPDATE deliveries SET status='sending' WHERE key=?", [&key])?;
+            tx.execute(
+                "UPDATE delivery_inputs SET attempts=attempts+1 WHERE delivery=?",
+                [&key],
+            )?;
+            tx.commit()?;
+            Ok(Some((key, event, plan)))
+        } else {
+            tx.commit()?;
+            Ok(None)
+        }
+    }
+    pub fn deferred_deadline(&self, key: &str) -> Result<Option<f64>> {
+        Ok(self
+            .db()?
+            .query_row(
+                "SELECT expires FROM delivery_inputs WHERE delivery=?",
+                [key],
+                |r| r.get::<_, Option<f64>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+    pub fn delivery_receipt(&self, key: &str) -> Result<Option<Value>> {
+        let raw: Option<String> = self
+            .db()?
+            .query_row("SELECT receipt FROM deliveries WHERE key=?", [key], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten();
+        Ok(raw.map(|r| serde_json::from_str(&r)).transpose()?)
+    }
+    /// Only an already-deferred final-plan lease can wait for Kakao login. This is a
+    /// read-only readiness gate, never a retry entitlement for a generic held/uncertain send.
+    pub fn retain_deferred_readiness(&self, key: &str, probe: &Value) -> Result<bool> {
+        if probe["status"] != "ready"
+            || probe["input_started"] != false
+            || probe["side_effects_started"] != false
+            || probe["text_sent"] != false
+            || probe["attachment_sent"] != false
+            || probe["open_target"]["read_only"] != true
+            || probe["open_target"]["keyboard_events_posted"] != false
+            || probe["open_target"]["clipboard_accessed"] != false
+            || !matches!(
+                probe["open_target"]["kakao_status"].as_str(),
+                Some("not_running" | "login_required")
+            )
+        {
+            return Ok(false);
+        }
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let prior:Option<String>=tx.query_row("SELECT d.receipt FROM deliveries d JOIN delivery_inputs i ON i.delivery=d.key WHERE d.key=?1 AND d.status='sending' AND d.phase='final' AND i.expires>?2",params![key,now()],|r|r.get(0)).optional()?.flatten();
+        let Some(prior) = prior else { return Ok(false) };
+        let mut receipt: Value = serde_json::from_str(&prior)?;
+        if receipt["status"] != "lock_deferred"
+            || !matches!(
+                receipt["lock_origin_reason"].as_str(),
+                Some("screen_locked" | "console_session_inactive")
+            )
+        {
+            return Ok(false);
+        }
+        receipt["reason"] = json!("waiting_for_kakao_login");
+        receipt["readiness"] = probe["open_target"].clone();
+        tx.execute(
+            "UPDATE deliveries SET status='lock_deferred',receipt=?1 WHERE key=?2",
+            params![serde_json::to_string(&receipt)?, key],
+        )?;
+        tx.execute(
+            "UPDATE delivery_inputs SET next_attempt=?1 WHERE delivery=?2",
+            params![now() + 30.0, key],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
     pub fn status(&self) -> Result<Value> {
         let db = self.db()?;
@@ -565,7 +705,7 @@ impl Store {
             scanned += 1;
             cursor = json!(created);
             let mut deliveries_stmt = db.prepare(
-                "SELECT phase,status,receipt FROM deliveries WHERE event_key=? ORDER BY rowid",
+                "SELECT d.phase,d.status,d.receipt,i.expires,i.next_attempt,i.attempts FROM deliveries d LEFT JOIN delivery_inputs i ON i.delivery=d.key WHERE d.event_key=? ORDER BY d.rowid",
             )?;
             let mut deliveries = Vec::new();
             for d in deliveries_stmt.query_map([&key], |r| {
@@ -573,14 +713,17 @@ impl Store {
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<f64>>(3)?,
+                    r.get::<_, Option<f64>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
                 ))
             })? {
-                let (phase, status, receipt) = d?;
+                let (phase, status, receipt, expires, next_attempt, attempts) = d?;
                 let raw: Value = receipt
                     .map(|s| serde_json::from_str(&s))
                     .transpose()?
                     .unwrap_or(json!({}));
-                deliveries.push(json!({"phase":phase,"status":status,"reason":raw["reason"],"verified_chat_name":raw["verified_chat_name"],"text_sent":raw["text_sent"],"attachment_sent":raw["attachment_sent"],"elapsed_seconds":raw["elapsed_seconds"]}));
+                deliveries.push(json!({"phase":phase,"status":status,"reason":raw["reason"],"native_reason":raw["native_reason"],"verified_chat_name":raw["verified_chat_name"],"text_sent":raw["text_sent"],"attachment_sent":raw["attachment_sent"],"elapsed_seconds":raw["elapsed_seconds"],"deferred":{"expires":expires,"next_attempt":next_attempt,"attempts":attempts}}));
             }
             // Only infer a legacy binding from a unique verified receipt title;
             // never invent the original prompt, caller or trigger tag.

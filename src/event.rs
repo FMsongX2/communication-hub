@@ -241,7 +241,7 @@ impl Plan {
         Self::parse_as(Agent::Yui, text, allowed)
     }
     pub fn parse_as(agent: Agent, text: &str, allowed: &Value) -> Result<Self> {
-        let mut p: Self = if text.trim_start().starts_with('{') {
+        let p: Self = if text.trim_start().starts_with('{') {
             serde_json::from_str(text)?
         } else {
             Self {
@@ -250,16 +250,49 @@ impl Plan {
                 sticker_id: None,
             }
         };
-        p.reply = format_reply_as(agent, &p.reply)?;
-        if p.bundle_id
+        p.validate_as(agent, allowed)
+    }
+    /// Structured channel model output, unlike the legacy manual-text parser. Accept one exact
+    /// JSON fence as a formatting variation, but never send malformed JSON as a chat message.
+    pub fn parse_json_as(agent: Agent, text: &str, allowed: &Value) -> Result<Self> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ModelPlan {
+            reply: String,
+            bundle_id: Value, // Required even when null; Option would silently allow omission.
+        }
+        let text = text.trim();
+        let body = if let Some(body) = text.strip_prefix("```json\n") {
+            body.strip_suffix("\n```")
+                .ok_or_else(|| anyhow::anyhow!("invalid_json_fence"))?
+        } else {
+            text
+        };
+        let raw: ModelPlan = serde_json::from_str(body)?;
+        let bundle_id = match raw.bundle_id {
+            Value::Null => None,
+            Value::String(id) => Some(id),
+            _ => bail!("invalid_bundle_id_type"),
+        };
+        Self {
+            reply: raw.reply,
+            bundle_id,
+            sticker_id: None,
+        }
+        .validate_as(agent, allowed)
+    }
+    fn validate_as(mut self, agent: Agent, allowed: &Value) -> Result<Self> {
+        self.reply = format_reply_as(agent, &self.reply)?;
+        if self
+            .bundle_id
             .as_ref()
             .is_some_and(|id| allowed.get(id).is_none())
         {
             bail!("unauthorized_attachment_bundle")
         }
-        if p.bundle_id.is_some() && p.sticker_id.is_some() {
+        if self.bundle_id.is_some() && self.sticker_id.is_some() {
             bail!("multiple_attachment_types")
         }
-        Ok(p)
+        Ok(self)
     }
 }

@@ -21,12 +21,269 @@ pub fn bundles(cfg: &Config, e: &Event) -> Result<Value> {
             .unwrap_or(json!({})),
     )
 }
-fn protected(path: &Path) -> bool {
+pub(crate) fn protected(path: &Path) -> bool {
     path.components().any(|x|matches!(x,Component::Normal(s) if ["PRIVATE",".ssh",".passwords",".codex",".claude",".env",".git"].iter().any(|v|s==*v)))
 }
-fn sensitive(bytes: &[u8]) -> bool {
+pub(crate) fn sensitive(bytes: &[u8]) -> bool {
     let text = String::from_utf8_lossy(bytes);
     text.contains("/Users/") || regex::Regex::new(r#"(?i)-----BEGIN .*PRIVATE KEY-----|"(?:api_key|access_token|password|secret_key)"\s*:\s*"[^"\s]+""#).unwrap().is_match(&text)
+}
+const ENTRY_LIMIT: usize = 4096;
+const FILE_LIMIT: u64 = 32 * 1024 * 1024;
+const TOTAL_LIMIT: u64 = 128 * 1024 * 1024;
+fn tar_header(bytes: &[u8]) -> bool {
+    if bytes.get(257..262) == Some(b"ustar") {
+        return true;
+    }
+    // Old V7 tar has no ustar marker. Recognize a valid first header checksum as well.
+    let Some(header) = bytes.get(..512) else {
+        return false;
+    };
+    let field = String::from_utf8_lossy(&header[148..156]);
+    let field = field.trim_matches([' ', '\0']);
+    if field.is_empty() || !field.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        return false;
+    }
+    let checksum: u64 = header
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            if (148..156).contains(&i) {
+                32
+            } else {
+                u64::from(*b)
+            }
+        })
+        .sum();
+    u64::from_str_radix(field, 8).ok() == Some(checksum)
+}
+fn opaque_container(name: &str, bytes: &[u8]) -> bool {
+    let name = name.trim_end_matches(['.', ' ']).to_ascii_lowercase();
+    let extension = Path::new(&name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let known_extension = [
+        "zip", "zipx", "gz", "gzip", "tgz", "taz", "bz", "bz2", "bzip", "bzip2", "tbz", "tbz2",
+        "tar", "xz", "txz", "zst", "zstd", "tzst", "lz4", "lzma", "tlz", "lz", "lzo", "7z", "rar",
+        "z", "cab", "cpio", "ar", "a", "lib", "iso", "dmg",
+    ]
+    .contains(&extension);
+    let skippable_frame =
+        bytes.len() >= 4 && (0x50..=0x5f).contains(&bytes[0]) && bytes[1..4] == [0x2a, 0x4d, 0x18]; // Zstandard and LZ4 share this framing.
+    known_extension
+        || tar_header(bytes)
+        || skippable_frame
+        || [
+            b"PK\x03\x04".as_slice(),
+            b"PK\x05\x06",
+            b"PK\x07\x08",
+            b"\x1f\x8b",
+            b"\x1f\x9d",
+            b"7z\xbc\xaf\x27\x1c",
+            b"Rar!",
+            b"\xfd7zXZ\0",
+            b"BZh",
+            b"\x28\xb5\x2f\xfd",
+            b"\x04\x22\x4d\x18",
+            b"\x02\x21\x4c\x18",
+            b"MSCF",
+            b"!<arch>\n",
+            b"070701",
+            b"070702",
+            b"070707",
+        ]
+        .iter()
+        .any(|magic| bytes.starts_with(magic))
+}
+fn payload_safe(name: &str, bytes: &[u8]) -> Result<()> {
+    if sensitive(bytes) {
+        bail!("protected_information_in_artifact")
+    }
+    // Nested containers would hide their payload from this scanner. Register their expanded
+    // directory instead; the legacy compound bundle already expands its result ZIP.
+    if opaque_container(name, bytes) {
+        bail!("nested_or_uninspected_archive")
+    }
+    Ok(())
+}
+fn member_safe(name: &str) -> bool {
+    let path = Path::new(name);
+    !name.is_empty()
+        && !name.contains(['\\', ':', '\0'])
+        && !path.is_absolute()
+        && !path
+            .components()
+            .any(|p| matches!(p, Component::ParentDir | Component::RootDir))
+        && !protected(path)
+}
+fn add_payload(
+    payloads: &mut Vec<(String, Vec<u8>)>,
+    name: String,
+    bytes: Vec<u8>,
+    total: &mut u64,
+) -> Result<()> {
+    if !member_safe(&name) || payloads.iter().any(|(n, _)| n == &name) {
+        bail!("unsafe_or_duplicate_archive_member")
+    }
+    *total += bytes.len() as u64;
+    if bytes.len() as u64 > FILE_LIMIT || *total > TOTAL_LIMIT || payloads.len() >= ENTRY_LIMIT {
+        bail!("archive_exceeds_size_budget")
+    }
+    payload_safe(&name, &bytes)?;
+    payloads.push((name, bytes));
+    Ok(())
+}
+fn walk_payloads(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    payloads: &mut Vec<(String, Vec<u8>)>,
+    total: &mut u64,
+    visited: &mut usize,
+) -> Result<()> {
+    if depth > 16 {
+        bail!("directory_too_deep")
+    }
+    for entry in fs::read_dir(dir)? {
+        *visited += 1;
+        if *visited > ENTRY_LIMIT {
+            bail!("too_many_directory_entries")
+        }
+        let path = entry?.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        let relative = path.strip_prefix(root)?;
+        if protected(relative) || metadata.file_type().is_symlink() {
+            bail!("protected_or_linked_artifact")
+        }
+        if metadata.is_dir() {
+            walk_payloads(root, &path, depth + 1, payloads, total, visited)?;
+        } else if metadata.is_file() && metadata.len() <= FILE_LIMIT {
+            let mut bytes = Vec::new();
+            fs::File::open(&path)?
+                .take(FILE_LIMIT + 1)
+                .read_to_end(&mut bytes)?;
+            add_payload(
+                payloads,
+                relative.to_string_lossy().into_owned(),
+                bytes,
+                total,
+            )?;
+        } else {
+            bail!("unsupported_or_oversized_file")
+        }
+    }
+    Ok(())
+}
+fn prepare_generic(cfg: &Config, key: &str, id: &str, b: &Value) -> Result<Value> {
+    let input = Path::new(
+        b["source"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing_bundle_source"))?,
+    );
+    if !input.is_absolute()
+        || protected(input)
+        || fs::symlink_metadata(input)?.file_type().is_symlink()
+    {
+        bail!("protected_or_linked_artifact")
+    }
+    let source = fs::canonicalize(input)?;
+    if protected(&source) {
+        bail!("protected_artifact")
+    }
+    let filename = b["filename"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing_bundle_filename"))?;
+    if !member_safe(filename)
+        || filename.contains('/')
+        || !filename.ends_with(".zip")
+        || filename.len() > 200
+    {
+        bail!("invalid_bundle_filename")
+    }
+    let mut payloads = Vec::new();
+    let mut total = 0;
+    match b["kind"].as_str() {
+        Some("directory") if source.is_dir() => {
+            walk_payloads(&source, &source, 0, &mut payloads, &mut total, &mut 0)?
+        }
+        Some("file") if source.is_file() => {
+            if fs::metadata(&source)?.len() > FILE_LIMIT {
+                bail!("artifact_too_large")
+            }
+            let mut bytes = Vec::new();
+            fs::File::open(&source)?
+                .take(FILE_LIMIT + 1)
+                .read_to_end(&mut bytes)?;
+            add_payload(
+                &mut payloads,
+                source.file_name().unwrap().to_string_lossy().into_owned(),
+                bytes,
+                &mut total,
+            )?;
+        }
+        Some("zip") if source.is_file() => {
+            if fs::metadata(&source)?.len() > TOTAL_LIMIT {
+                bail!("artifact_too_large")
+            }
+            let mut old = ZipArchive::new(fs::File::open(&source)?)?;
+            if old.len() > ENTRY_LIMIT {
+                bail!("too_many_archive_entries")
+            }
+            for i in 0..old.len() {
+                let mut entry = old.by_index(i)?;
+                if !member_safe(entry.name())
+                    || entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000)
+                {
+                    bail!("unsafe_archive_member")
+                }
+                if entry.is_dir() {
+                    continue;
+                }
+                if entry.size() > FILE_LIMIT {
+                    bail!("archive_exceeds_size_budget")
+                }
+                let name = entry.name().to_owned();
+                let mut bytes = Vec::new();
+                entry
+                    .by_ref()
+                    .take(FILE_LIMIT + 1)
+                    .read_to_end(&mut bytes)?;
+                add_payload(&mut payloads, name, bytes, &mut total)?;
+            }
+        }
+        _ => bail!("invalid_bundle_kind_or_source"),
+    }
+    if payloads.is_empty() {
+        bail!("empty_artifact_bundle")
+    }
+    payloads.sort_by(|a, b| a.0.cmp(&b.0));
+    let job = cfg.kakao.sender_ipc.join("file-jobs").join(key);
+    private_dir(&job)?;
+    let name = format!(
+        "{}-{}.zip",
+        filename.strip_suffix(".zip").unwrap(),
+        &key[..8]
+    );
+    let output = job.join(&name);
+    let mut writer = ZipWriter::new(fs::File::create(&output)?);
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .compression_level(Some(6));
+    for (name, bytes) in &payloads {
+        writer.start_file(name, options)?;
+        writer.write_all(bytes)?;
+    }
+    writer.finish()?.sync_all()?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o600))?;
+    let mut check = ZipArchive::new(fs::File::open(&output)?)?;
+    for i in 0..check.len() {
+        std::io::copy(&mut check.by_index(i)?, &mut std::io::sink())?;
+    }
+    Ok(
+        json!({"path":output,"filename":name,"bytes":fs::metadata(&output)?.len(),"sha256":digest(fs::read(&output)?),"entries":payloads.len(),"bundle_id":id}),
+    )
 }
 pub fn prepare(cfg: &Config, e: &Event, key: &str, id: &str) -> Result<Value> {
     if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -41,6 +298,9 @@ pub fn prepare(cfg: &Config, e: &Event, key: &str, id: &str) -> Result<Value> {
             anyhow::anyhow!("invalid_bundle_config")
         })?)?)
     };
+    if b.get("kind").is_some() {
+        return prepare_generic(cfg, key, id, b);
+    }
     let taxonomy = path(if b.get("json_source").is_some() {
         "json_source"
     } else {
@@ -80,44 +340,37 @@ pub fn prepare(cfg: &Config, e: &Event, key: &str, id: &str) -> Result<Value> {
     if old.len() > 4096 {
         bail!("too_many_archive_entries")
     }
-    let mut payloads = vec![(
+    let mut payloads = Vec::new();
+    let mut total = 0u64;
+    add_payload(
+        &mut payloads,
         taxonomy.file_name().unwrap().to_string_lossy().into_owned(),
         raw,
-    )];
-    let mut total = 0u64;
-    let mut actual_total = 0u64;
+        &mut total,
+    )?;
     for i in 0..old.len() {
         let mut entry = old.by_index(i)?;
         let name = entry.name().to_owned();
-        let member = Path::new(&name);
-        if member.is_absolute()
-            || name.contains('\\')
-            || name.contains(':')
-            || member
-                .components()
-                .any(|p| matches!(p, Component::ParentDir))
-            || protected(member)
-            || entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000)
-        {
+        if !member_safe(&name) || entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
             bail!("unsafe_archive_member")
         }
-        total += entry.size();
-        if entry.size() > 32 * 1024 * 1024 || total > 128 * 1024 * 1024 {
+        if entry.is_dir() {
+            continue;
+        }
+        if entry.size() > FILE_LIMIT {
             bail!("archive_exceeds_size_budget")
         }
         let mut bytes = Vec::new();
         entry
             .by_ref()
-            .take(32 * 1024 * 1024 + 1)
+            .take(FILE_LIMIT + 1)
             .read_to_end(&mut bytes)?;
-        actual_total += bytes.len() as u64;
-        if bytes.len() > 32 * 1024 * 1024 || actual_total > 128 * 1024 * 1024 {
-            bail!("expanded_archive_exceeds_size_budget")
-        }
-        if sensitive(&bytes) {
-            bail!("protected_information_in_artifact")
-        }
-        payloads.push((format!("assign-context/{name}"), bytes));
+        add_payload(
+            &mut payloads,
+            format!("assign-context/{name}"),
+            bytes,
+            &mut total,
+        )?;
     }
     let job = cfg.kakao.sender_ipc.join("file-jobs").join(key);
     private_dir(&job)?;

@@ -49,6 +49,9 @@ fn config(root: &Path) -> Config {
             sender_ipc: root.join("ipc"),
             prewarm: false,
             watch_open_room: false,
+            defer_locked_delivery: true,
+            deferred_delivery_ttl_seconds: 86400,
+            locked_ax_text: false,
         },
     }
 }
@@ -297,13 +300,13 @@ fn zip_preserves_bytes_and_room_scope() {
     let t = TempDir::new().unwrap();
     let c = config(t.path());
     let e = event();
-    bundle_fixture(&c, "67d39f5c/manifest.json", b"{\"ok\":true}");
+    bundle_fixture(&c, "abc12345/manifest.json", b"{\"ok\":true}");
     let artifact = attachments::prepare(&c, &e, &e.key(), "bundle").unwrap();
     let mut z =
         zip::ZipArchive::new(std::fs::File::open(artifact["path"].as_str().unwrap()).unwrap())
             .unwrap();
     let mut data = Vec::new();
-    z.by_name("assign-context/67d39f5c/manifest.json")
+    z.by_name("assign-context/abc12345/manifest.json")
         .unwrap()
         .read_to_end(&mut data)
         .unwrap();
@@ -1268,7 +1271,7 @@ async fn yumi_call_runs_one_shot_isolated_claude_with_her_prefix() {
     let mut c = config(t.path());
     c.yumi = Some(fake_claude(
         t.path(),
-        r#"{"type":"result","subtype":"success","is_error":false,"result":"안녕! 나는 오빠의 여동생 유미야"}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"reply\":\"안녕! 나는 오빠의 여동생 유미야\",\"bundle_id\":null}"}"#,
     ));
     c.expressions = Some(communication_hub::config::ExpressionConfig {
         catalog: t.path().join("unused.json"),
@@ -1595,9 +1598,14 @@ fn context_reset_hides_earlier_exchanges_and_approval_initializes_the_room() {
 async fn busy_notice_is_a_fixed_reply_without_a_model() {
     use communication_hub::event::Agent;
     let t = TempDir::new().unwrap();
-    let c = config(t.path());
+    let mut c = config(t.path());
+    c.yumi = Some(fake_claude(
+        t.path(),
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"reply\":\"unused\",\"bundle_id\":null}"}"#,
+    ));
     let s = Store::open(c.state.clone()).unwrap();
     let e = event();
+    approve_room(&c, &e);
     // With sending off the notice is journaled but not sent; its text needs no model.
     let receipt = worker::notify_busy(&c, &s, &e.for_agent(Agent::Yumi))
         .await

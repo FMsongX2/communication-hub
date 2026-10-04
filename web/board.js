@@ -5,7 +5,7 @@ if(hash.has('token')){const t=hash.get('token');if(/^[0-9a-f]{64}$/.test(t))sess
 let token=sessionStorage.getItem('communication-hub-token')||'';
 let snapshot=null,records=[],scope=null,before=null,nextBefore=null,hasMore=false,refreshing=false,lastGood=null;
 const providerNames={kakao:'카카오톡',discord:'Discord',slack:'Slack',notion:'Notion'};
-const statusLabels={sent_verified:['전송 확인','online'],pending:['대기 중','neutral'],dispatching:['처리 중','busy'],rejected:['호출 차단','held'],held:['보류','held'],ambiguous:['처리 미확인','held'],sending_uncertain:['전송 미확인','held'],sending:['전송 미확인','held'],partial_file_held:['첨부 보류','held'],prepared_not_sent:['답변 준비','neutral'],prepared:['준비됨','neutral']};
+const statusLabels={sent_verified:['전송 확인','online'],pending:['대기 중','neutral'],dispatching:['처리 중','busy'],rejected:['호출 차단','held'],held:['보류','held'],lock_deferred:['잠금·로그인 대기','held'],ambiguous:['처리 미확인','held'],sending_uncertain:['전송 미확인','held'],sending:['전송 미확인','held'],partial_file_held:['첨부 보류','held'],prepared_not_sent:['답변 준비','neutral'],prepared:['준비됨','neutral']};
 function elem(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=String(text);return e;}
 function badge(text,cls){return elem('span','badge '+cls,text);}
 function value(id,text){$(id).textContent=text;}
@@ -89,7 +89,7 @@ function details(c){
  wrap.append(grid,elem('h2',null,'호출 원문'),elem('pre',null,c.body||'원문이 저장되지 않은 기록이에요.'));
  wrap.append(elem('h2',null,'접수와 최종 전송'));
  if(!c.deliveries.length)wrap.append(elem('p','muted','전송 기록이 없어요.'));
- for(const d of c.deliveries){const row=elem('div','detail-step');const label=statusLabels[d.status]||[d.status,'neutral'];row.append(elem('span','mono',d.phase==='ack'?'접수':d.phase==='busy'?'바쁨 안내':d.phase==='final'?'최종':d.phase),badge(...label));const text=[d.reason,d.verified_chat_name,typeof d.elapsed_seconds==='number'?`${d.elapsed_seconds.toFixed(2)}초`:null,d.attachment_sent===true?'첨부 확인':null].filter(Boolean).join(' · ');row.append(elem('span','muted',text));wrap.append(row);}
+ for(const d of c.deliveries){const row=elem('div','detail-step');const label=statusLabels[d.status]||[d.status,'neutral'];row.append(elem('span','mono',d.phase==='ack'?'접수':d.phase==='busy'?'바쁨 안내':d.phase==='final'?'최종':d.phase),badge(...label));const text=[d.reason,d.verified_chat_name,typeof d.elapsed_seconds==='number'?`${d.elapsed_seconds.toFixed(2)}초`:null,d.attachment_sent===true?'첨부 확인':null,d.native_reason,d.status==='lock_deferred'&&d.deferred?.expires?`총기한 ${time(d.deferred.expires)}`:null,d.status==='lock_deferred'&&d.deferred?.next_attempt?`다음 확인 ${time(d.deferred.next_attempt)}`:null,d.status==='lock_deferred'&&typeof d.deferred?.attempts==='number'?`재개 확인 ${d.deferred.attempts}회`:null].filter(Boolean).join(' · ');row.append(elem('span','muted',text));wrap.append(row);}
  $('details').showModal();
 }
 async function loadCalls(){const params=new URLSearchParams();if(scope)params.set('conversation',scope);if(before)params.set('before',before);const data=await api('/api/calls?'+params);records=data.items;nextBefore=data.next_before;hasMore=data.has_more;drawCalls();}

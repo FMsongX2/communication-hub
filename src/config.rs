@@ -84,6 +84,17 @@ pub struct KakaoConfig {
     /// holds Accessibility) also runs a read-only watch of that room and forwards tagged messages.
     #[serde(default)]
     pub watch_open_room: bool,
+    /// Persist verified no-input lock rejections and retry the saved final plan after unlock.
+    #[serde(default = "yes")]
+    pub defer_locked_delivery: bool,
+    #[serde(default = "default_deferred_ttl")]
+    pub deferred_delivery_ttl_seconds: u64,
+    /// Experimental: already-open, unique room; AXValue and bound AXPress only. No files.
+    #[serde(default)]
+    pub locked_ax_text: bool,
+}
+fn default_deferred_ttl() -> u64 {
+    86400
 }
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
@@ -93,6 +104,8 @@ impl Config {
             || c.effort.trim().is_empty()
             || !c.socket.is_absolute()
             || !c.state.is_absolute()
+            || c.kakao.deferred_delivery_ttl_seconds == 0
+            || c.kakao.deferred_delivery_ttl_seconds > 86400
         {
             bail!("invalid hub configuration")
         }
@@ -100,7 +113,8 @@ impl Config {
     }
     pub fn descriptors(&self) -> Value {
         json!([
-            {"provider":"kakao","enabled":self.kakao.enabled,"kind":"chat","transport":"macos_notification_and_ax","capabilities":["receive_calls","reply_text","approved_bundle_attachment","approved_sticker_attachment"],"sticker_catalog_configured":self.expressions.is_some(),"sticker_formats":["PNG"],"attachment_live_verified":false,"uses_pointer":false},
+            {"provider":"kakao","enabled":self.kakao.enabled,"kind":"chat","transport":"macos_notification_and_ax","capabilities":["receive_calls","reply_text","approved_bundle_attachment","approved_sticker_attachment","deferred_final_delivery"],"sticker_catalog_configured":self.expressions.is_some(),"sticker_formats":["PNG"],"attachment_live_verified":false,"uses_pointer":false,
+            "defer_locked_delivery":self.kakao.defer_locked_delivery,"deferred_delivery_ttl_seconds":self.kakao.deferred_delivery_ttl_seconds,"locked_ax_text_opt_in":self.kakao.locked_ax_text,"locked_ax_text_live_verified":false,"locked_attachment_supported":false},
             {"provider":"discord","enabled":false,"kind":"chat","status":"adapter_not_implemented","capabilities":[]},
             {"provider":"slack","enabled":false,"kind":"chat","status":"adapter_not_implemented","capabilities":[]},
             {"provider":"notion","enabled":false,"kind":"documents_and_comments","status":"adapter_not_implemented","capabilities":[]}

@@ -115,6 +115,34 @@ pub async fn run(cfg: Config, no_receiver: bool) -> Result<()> {
         tokio::spawn(async move {
             loop {
                 if active.load(Ordering::SeqCst) {
+                    if sending.load(Ordering::SeqCst) {
+                        // The deferred journal contains the prepared final Plan. Resuming never
+                        // runs a model, and its sending lease obeys the usual uncertain recovery.
+                        if let Ok(Some((key, e, plan))) = store.claim_deferred_delivery(now()) {
+                            processing.store(true, Ordering::SeqCst);
+                            let receipt = resume_locked_delivery(&cfg,&store,&key,&e,&plan).await
+                                .unwrap_or_else(|_|json!({"status":"sending_uncertain","reason":"deferred_transport_outcome_uncertain"}));
+                            if receipt["status"] != "lock_deferred" {
+                                let _ = store.complete_delivery(&key, &receipt);
+                            }
+                            let saved = store
+                                .delivery_receipt(&key)
+                                .ok()
+                                .flatten()
+                                .unwrap_or(receipt);
+                            let _ = store.finish_event(
+                                &e.key(),
+                                saved["status"].as_str().unwrap_or("sending_uncertain"),
+                                saved["reason"].as_str().unwrap_or(""),
+                            );
+                            let _ = atomic(
+                                &cfg.state.join("last-delivery.json"),
+                                &json!({"event_key":e.key(),"resumed_saved_plan":true,"result":saved,"at":now()}),
+                            );
+                            processing.store(false, Ordering::SeqCst);
+                            continue;
+                        }
+                    }
                     let event = match store.claim_next() {
                         Ok(e) => e,
                         Err(_) => {
@@ -238,6 +266,74 @@ pub async fn run(cfg: Config, no_receiver: bool) -> Result<()> {
     let _ = std::fs::remove_file(&cfg.socket);
     drop(lock);
     Ok(())
+}
+/// A deferred plan retains the originally approved conversation, not arbitrary new UI text.
+/// Recheck revocation, sister gate, context reset, current policy and total age before any write.
+pub fn validate_deferred_authorization(cfg: &Config, e: &Event) -> Result<()> {
+    let saved = e.metadata["__hub_authorization_stamp"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("authorization_changed_or_missing"))?;
+    let current = crate::capabilities::authorization_stamp(cfg, e)
+        .map_err(|_| anyhow::anyhow!("authorization_changed_or_missing"))?;
+    if saved != current {
+        bail!("authorization_changed_or_missing")
+    }
+    Ok(())
+}
+pub async fn resume_locked_delivery(
+    cfg: &Config,
+    store: &Store,
+    key: &str,
+    e: &Event,
+    plan: &crate::event::Plan,
+) -> Result<Value> {
+    use crate::adapters::Adapter;
+    let held = |reason: &str| json!({"status":"held","reason":reason});
+    if !cfg.dispatch_enabled || !cfg.external_auto_send {
+        return Ok(held("deferred_send_disabled"));
+    }
+    match crate::capabilities::delivery_gate(cfg, store, e) {
+        Ok(Some(reason)) => return Ok(held(&format!("deferred_{reason}"))),
+        Err(_) => return Ok(held("deferred_delivery_gate_unavailable")),
+        Ok(None) => {}
+    }
+    if store.deferred_deadline(key)?.is_none_or(|at| at <= now()) {
+        return Ok(held("deferred_delivery_expired"));
+    }
+    if validate_deferred_authorization(cfg, e).is_err() {
+        return Ok(held("authorization_changed_or_missing"));
+    }
+    let kakao = crate::adapters::Kakao { cfg: cfg.clone() };
+    let probe = kakao.session_state().await?;
+    if store.retain_deferred_readiness(key, &probe)? {
+        return Ok(store.delivery_receipt(key)?.unwrap());
+    }
+    // A failing read-only probe never licenses a speculative UI write.
+    if probe["status"] != "ready" {
+        return Ok(held("deferred_readiness_unavailable"));
+    }
+    if matches!(
+        probe["open_target"]["session_state"].as_str(),
+        Some("locked" | "inactive")
+    ) && (!cfg.kakao.locked_ax_text || plan.bundle_id.is_some() || plan.sticker_id.is_some())
+    {
+        let mut rejected = probe;
+        rejected["status"] = json!("held");
+        rejected["reason"] = json!(if rejected["open_target"]["session_state"] == "locked" {
+            "screen_locked"
+        } else {
+            "console_session_inactive"
+        });
+        rejected["defer_locked_delivery"] = json!(cfg.kakao.defer_locked_delivery);
+        rejected["retry_deadline"] = json!(store.deferred_deadline(key)?);
+        return Ok(rejected);
+    }
+    // The read-only readiness probe can take time. Recheck once more before staging or writing
+    // anything so a policy/share change while waiting does not license the saved old reply.
+    if validate_deferred_authorization(cfg, e).is_err() {
+        return Ok(held("authorization_changed_or_missing"));
+    }
+    kakao.send(store, key, e, plan).await
 }
 fn handle(
     cfg: &Config,

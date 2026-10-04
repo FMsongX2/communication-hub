@@ -26,7 +26,7 @@ flowchart LR
 - Reloads the configured Contact-Other policy before each model invocation and external write.
 - Uses a compatible local Codex App Server over WebSocket/JSON-RPC on a Unix socket. Model and reasoning effort are configurable.
 - Provides `status`, `adapters`, `pause`, and `resume` through a same-user local control socket. Pause survives restart.
-- Builds approved JSON + ZIP bundles with path, size, CRC, and basic sensitive-content checks.
+- Gives both Yui and Yumi the same room-approved artifact descriptors and project facts; the host builds approved file, directory, ZIP or compound JSON + ZIP exports with path, size, CRC, and basic sensitive-content checks.
 - Uses Swift helpers for macOS permissions and Accessibility. The runtime requires neither Python nor Orca.
 
 The current worker is serial. This is an adapter foundation, not a ready-made universal integration or dynamic plugin loader.
@@ -65,7 +65,19 @@ communication-hub resume
 
 Use the installed binary's full path or add its `bin` directory to your PATH. A first KakaoTalk call uses `@[유이]`; conversations with an earlier binding or a verified reply accept both `@[유이]` and `[유이]`. Untagged messages do not invoke the model.
 
-When sending, the helper rechecks the conversation and trigger, rejects ambiguous names, preserves an existing draft, and verifies a new outgoing bubble. It does not move or click the mouse pointer. It can temporarily bring KakaoTalk forward and send a key to that process. Locked sessions, unavailable Accessibility rows, or ambiguous targets are held.
+When sending, the helper rechecks the conversation and trigger, rejects ambiguous names, preserves an existing draft, and verifies a new outgoing bubble. It does not move or click the mouse pointer. It can temporarily bring KakaoTalk forward and send a key to that process. Unavailable Accessibility rows or ambiguous targets are held. Proven no-input lock rejections retain only the final plan for delivery after unlock; see below.
+
+## Unattended project work
+
+Yui and Yumi can select an artifact approved for the calling room or explain deliberately published project status. Room reply approval and permission to share artifacts or project facts are separate. The host supplies the same bounded capabilities to both models and validates their `reply` + `bundle_id` plans; Yumi needs no shell or filesystem tools for these operations.
+
+Register exact shareable files/output directories or ZIPs in the private artifact registry. Generic registrations use `kind: file`, `directory` or `zip`; registered ZIPs are expanded, checked and repacked. They do not authorize arbitrary filesystem searches, entire projects, or remote-server downloads. Artifact descriptors omit actual source paths; this is not a claim that the entire model prompt contains no paths.
+
+Work agents in registered projects use `publish-status --file PRIVATE_UPDATE.json` to publish approved completion, remaining work and actual verification, with `as_of`. Replies distinguish `owner_published_shared_status` (`fresh`, `stale`, `missing`, `invalid`) from timestamped `live_local_git` observations. Stale data is last published state, not current progress. A commit or changed file alone never proves completion or tests passed. [Registration and publication examples](docs/unattended-work.md) use synthetic identifiers.
+
+By default, a final plan rejected while locked **before any input or side effect** is saved for at most 24 hours (`kakao.defer_locked_delivery=true`). After unlock it resumes without another model call. If that saved plan encounters a proven Kakao login screen, it waits for normal login within the same deadline. Every attempt rechecks room approval, sister switch, context reset, policy and room-scoped sharing authorization, plus the exact native destination; changed authority holds the old plan. ACKs are not replayed and uncertain or partial sends are never retried automatically.
+
+The separate `kakao.locked_ax_text` experiment is off by default and unverified on a physically locked Mac. It supports only text in an already-open, uniquely verified room with an empty composer; files are unsupported while locked. The service does not wake a sleeping Mac, unlock it or log in for the owner. See [locked delivery and controlled tests](docs/locked-delivery.md).
 
 ## Local management board
 
@@ -75,7 +87,7 @@ Enable the optional board in your private configuration:
 "dashboard": { "port": 43197, "store_body": false }
 ```
 
-After restarting the hub, run `communication-hub board --open`. This opens an authenticated local board; `communication-hub board` reports its clean URL. It binds only to `127.0.0.1`, requires a rotating bearer token for private APIs, and observes sessions read-only; its only changes are room approval, per-room sister switches and room-name verification. A public page or unauthenticated browser cannot read the session/call data.
+After restarting the hub, run `communication-hub board --open`. This opens an authenticated local board; `communication-hub board` reports its clean URL. It binds only to `127.0.0.1`, requires a rotating bearer token for private APIs, and observes backends without model calls. Its changes are room approval, per-room sister switches, room-name verification and context reset. A public page or unauthenticated browser cannot read the session/call data.
 
 The board shows the room registry (approval, per-sister switches, name verification, context reset), receiver heartbeat, backend connection, and the call log with tags, results, ACK/final receipts, per-room filters, search, pagination and details. Calls are stateless, so the board no longer lists model threads; its backend check is a connection handshake that never reads, resumes or starts a thread. **Reset context** stops a room's earlier exchanges from being passed to Yui and Yumi, for example after a confused or manipulated conversation. Connection freshness is displayed separately from dispatch/send gates and does not represent participants' chat presence.
 
@@ -123,7 +135,7 @@ With a `yumi` block, `@[유미]`/`[유미]` calls are answered by Claude Code in
 {"yumi":{"claude_bin":"/absolute/path/to/claude","persona":"/absolute/path/to/CLAUDE.md","model":"claude-sonnet-5-5","effort":"low"}}
 ```
 
-Each call is stateless and tool-free: one pre-spawned `claude -p` process (stream-json input) answers exactly one message and exits, and the next is spawned in the background, so CLI start-up stays off the reply path. User settings, hooks, MCP servers, skills, tools and session persistence are disabled, so the CLI's own `CLAUDE.md` loading is off too; the configured persona file, Contact-Other with Yumi as the speaker, and the call rules form the system prompt. Requests that need files are redirected to `[유이]`. Replies use the `[System-유미] : ` prefix, which is also rejected as an echo. The CLI must be logged in with the owner's account. If the Contact-Other source ever names Yumi, the speaker swap is ambiguous and Yumi calls stop instead of guessing.
+Each call is stateless and tool-free: one pre-spawned `claude -p` process (stream-json input) answers exactly one message and exits, and the next is spawned in the background, so CLI start-up stays off the reply path. User settings, hooks, MCP servers, skills, tools and session persistence are disabled, so the CLI's own `CLAUDE.md` loading is off too; the configured persona file, Contact-Other with Yumi as the speaker, and the call rules form the system prompt. The host gives Yumi the same approved artifact descriptors and project facts as Yui, then executes her validated plan through the common ZIP/delivery path. Arbitrary tool use and remote fetch remain unavailable. Yumi output must be exactly a `reply` + `bundle_id` JSON object; invalid output is held rather than sent as raw JSON. Code adds `[System-유미] : ` and rejects it as an echo. The CLI must be logged in with the owner's account. If the Contact-Other source ever names Yumi, the speaker swap is ambiguous and Yumi calls stop instead of guessing.
 
 ## Optional expression catalog
 
@@ -139,4 +151,4 @@ Rust verifies ZIP CRC, PNG signature, size, and SHA-256 and stages the original 
 
 Optional `emoticons` points to private JSON with an `items` array of `{ "text": "…" }` records (one-line text faces, up to 256). Like stickers, the face is picked by code: one uniformly at random per reply, skipping the face in the room's previous reply while another is available. The model is told which face to place and nothing else; a reply that leaves it out gets it appended, and fixed usage-limit notices get none. Without a pool the model is told to use no face. Missing original collections are not invented. Sticker art, catalogs, and conversation histories are not distributed with this repository; obtain appropriate rights for your own assets.
 
-The wire prefix `[System-유이] : ` is added once by code. The model generates only the body; legacy prefixed output is normalized before journaling and sending. Delivery checks are UI observations, not recipient read receipts.
+The wire prefixes `[System-유이] : ` and `[System-유미] : ` are added once by code. The model generates only the body; legacy prefixed output is normalized before journaling and sending. Delivery checks are UI observations, not recipient read receipts. A full reply carrying a file/image waits for unlock when locked; no text-only partial delivery is attempted by the experimental locked path.

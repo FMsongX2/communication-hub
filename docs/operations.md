@@ -33,6 +33,8 @@ With `kakao.watch_open_room` on, one long-running copy of the sender app runs `-
 Files under the configured state directory:
 
 - `hub.sqlite3`: queue, legacy session bindings, routes, introductions, and delivery journal.
+- `project-capabilities.json`: owner-approved room/project facts registry.
+- `shared-status/`: deliberately published, dated project snapshots.
 - `control.json`: persistent pause gate.
 - `source-kakao.json`: source status and observation time.
 - `last-delivery.json`: recent result, including reply text; keep private.
@@ -45,6 +47,12 @@ Native IPC directories contain transient requests, receipts, draft recovery file
 An interrupted `dispatching` event becomes `ambiguous`; an interrupted `sending` attempt becomes `sending_uncertain`. Inspect the real destination and receipt before deciding on a new attempt. A stale native phase file cannot prove that no UI input occurred, so timeouts are never labeled safely retryable from that file alone.
 
 The receiver retries transport and temporary service/storage failures. Permanent policy rejection is acknowledged without replay. On restart, recently retained notifications can be submitted again, while event ID deduplication and age checks suppress duplicate or stale work. This cannot recover messages that never generated a usable notification or were removed from the retained notification database.
+
+### Locked final-plan outbox
+
+The default `kakao.defer_locked_delivery=true` retains only final plans whose native lock/session rejection proves zero input and side effects. `deferred_delivery_ttl_seconds` defaults to 86400 (maximum 24 hours); the fixed deadline is not renewed by retries. The private `delivery_inputs` table keeps the original Event alongside the journaled Plan. Every 30 seconds, eligible work may resume without another model invocation. For an already-deferred plan only, a proven Kakao login window/process absence waits for normal login within the same deadline. The board shows `lock_deferred` or `waiting_for_kakao_login` as waiting, with deadline/check/attempt details.
+
+Before transport, fresh room approval, sister switch, reset cutoff, host-created policy/sharing stamp and native target checks still apply. Changed or missing authority holds the old reply; partial/uncertain delivery is terminal for automatic retry. This is an outbox, not permission to replay ACKs or interrupted sends. `kakao.locked_ax_text` stays off by default: its already-open-room text-only path needs a real owner-controlled locked test, and files are unsupported while locked. Sleep is not handled by waking the Mac. See [locked delivery](locked-delivery.md) before enabling the experiment.
 
 ## Bundles
 
@@ -67,6 +75,8 @@ Create `attachment-bundles.json` in the configured Kakao data directory. Each co
 
 `expected_issue_count` optionally checks an `issues` array. The older `taxonomy` field remains supported for migration and retains its legacy count check. No real project file or sharing grant ships with the repository. The content scanner is heuristic and does not replace a review of the approved source files.
 
+Both models may choose the same approved bundle IDs. Generic `kind: file`, `directory` and `zip` registrations package only the explicitly registered source; registered ZIPs are expanded, inspected and repacked. Nested opaque archives, symlinks, traversal, protected members and budget violations are refused. This does not enable remote fetch or authorize a whole project. Follow [unattended work](unattended-work.md) for exact registry examples, limits and `publish-status`/`capabilities` CLI usage. Project-status sharing is registered separately from attachment sharing. Work agents publish dated completion, pending work and verification at material changes; absent/stale snapshots are not inferred from Git.
+
 ## Upgrade and rollback
 
 Build and test a new binary separately. Pause, wait for in-flight work, replace the installed binary atomically, and restart the user service. Confirm a new PID and a fresh heartbeat before resuming. Preserve the databases and pause state. Coordinate native helper changes with the config's IPC/state paths and macOS grants.
@@ -79,4 +89,4 @@ The optional `dashboard` object controls the loopback port and `store_body` flag
 
 `call_log` joins accepted/rejected calls to the durable event journal. It stores provider/account/conversation identity, message ID, observed tag, occurrence time, notification title, and optionally original body. The notification title is not authenticated sender identity. Do not export screenshots or DBs containing actual calls into the public repository. Body retention has no automatic expiration yet; set `store_body=false` before collecting sensitive workflows unless retention is intended. Previously stored bodies remain until the operator manages retention.
 
-The board refreshes visible state every four seconds; backend observation runs on a bounded fifteen-second cycle and only reads metadata. Unavailable or stale probes are shown as unknown/offline, while `notLoaded` remains a stored-session state. Optional HTTP bind failure leaves the hub worker operational and records `port_unavailable`.
+The board refreshes visible state every four seconds; backend observation runs on a bounded fifteen-second cycle and checks connectivity without running a model or resuming a room thread. Unavailable or stale probes are shown as unknown/offline. Room approval, sister switches, name verification and context reset are its owner-authenticated changes. Optional HTTP bind failure leaves the hub worker operational and records `port_unavailable`.
