@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import ApplicationServices
 import Darwin
+import CryptoKit
 // Chat-row selection/action sequence follows OpenKakao ax_send (MIT). See third_party/openkakao.
 
 let senderBase=URL(fileURLWithPath:CommandLine.arguments[0]).standardizedFileURL.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -17,6 +18,7 @@ var inputStarted=false
 var attachmentSent=false
 var cleanupClipboard:(()->Void)?=nil
 var openTarget:[String:Any]?=nil
+var attachmentVerification:String?=nil
 func stamp(_ key:String){
  timing[key]=Date().timeIntervalSince(startedAt)
  if let request=requestKey {
@@ -39,6 +41,7 @@ func finish(_ status:String,_ reason:String="") -> Never {
  r["draft_restored"]=draftRestored
  r["text_sent"]=textSent
  r["attachment_sent"]=attachmentSent
+ if let check=attachmentVerification {r["attachment_verification"]=check}
  r["elapsed_seconds"]=Date().timeIntervalSince(startedAt)
  if let key=requestKey,key.range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil {
  let output=senderState.appendingPathComponent("sender-receipts/"+key+".json")
@@ -58,9 +61,11 @@ struct Node {
  var isComposer:Bool {role==kAXTextAreaRole && (description=="메시지 입력" || title=="메시지 입력" || placeholder=="메시지 입력")}
  var isSend:Bool {role==kAXButtonRole && (title=="전송" || description=="전송")}
 }
-func collect(_ root:AXUIElement)->[Node] {
+// visibleRowsOnly: walk only on-screen table rows. Used where the target is known to be on screen
+// (a just-sent message, an upload sheet); full history traversal stays the default.
+func collect(_ root:AXUIElement,visibleRowsOnly:Bool=false)->[Node] {
  var result:[Node]=[]
- let optimizeTableRows=str(root,kAXTitleAttribute)=="카카오톡"
+ let optimizeTableRows=visibleRowsOnly || str(root,kAXTitleAttribute)=="카카오톡"
  let keys=[kAXRoleAttribute,kAXValueAttribute,kAXTitleAttribute,kAXDescriptionAttribute,"AXPlaceholderValue",kAXEnabledAttribute,kAXChildrenAttribute] as CFArray
  func visit(_ e:AXUIElement,_ depth:Int){
   if depth>24 || result.count>=8000{return}
@@ -137,18 +142,41 @@ func findCandidates()->[(AXUIElement,[Node])] {
  }
  return found
 }
+let roomNameVerified=p["room_name_verified"] as? Bool == true
+let triggerDigest=SHA256.hash(data:Data(trigger.utf8)).map{String(format:"%02x",$0)}.joined()
+let listScanURL=senderState.appendingPathComponent("list-scan.json")
+var openedFromList=false
+// The full per-row scan proves the name is unique in the chat list. A probe or ACK for the same
+// event runs it moments earlier, so a send that found the room already open may reuse that proof
+// when the name, trigger, list size and strictness all match within 90 seconds.
+func reusableListScan(_ actualName:String,_ rowCount:Int)->Bool {
+ guard !openedFromList,let data=try? Data(contentsOf:listScanURL),
+       let c=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any],
+       c["chat_name"] as? String==actualName,c["trigger_sha256"] as? String==triggerDigest,c["rows"] as? Int==rowCount,
+       c["room_name_verified"] as? Bool==false || c["room_name_verified"] as? Bool==roomNameVerified,
+       let at=c["verified_at"] as? Double else{return false}
+ let age=Date().timeIntervalSince1970-at
+ return age>=0 && age<=90
+}
 func verifyListTarget(_ actualName:String){
  let main=windowList().filter{str($0,kAXTitleAttribute)=="카카오톡"}
  guard main.count==1 else{finish("held","chat_list_window_missing_or_ambiguous")}
  let tables=collect(main[0]).filter{$0.role==kAXTableRole}
  guard tables.count==1,let rows=attr(tables[0].element,"AXRows") as? [AXUIElement],!rows.isEmpty,rows.count<=10000 else{finish("held","complete_chat_rows_unavailable")}
  if let count=attr(tables[0].element,"AXRowCount") as? Int,count>rows.count {finish("held","chat_rows_incomplete")}
+ if reusableListScan(actualName,rows.count) {stamp("list_scan_reused");return}
  let matching=rows.filter{row in collect(row).contains{node in node.role==kAXStaticTextRole && [node.value,node.title,node.description].contains{labelMatches($0,actualName)}}}
  guard matching.count==1 else{finish("held","duplicate_or_missing_chat_name")}
  if p["room_name_verified"] as? Bool != true {
   let previews=rows.filter{row in collect(row).contains{node in node.role==kAXTextAreaRole && [node.value,node.title,node.description].contains(trigger)}}
   guard previews.count==1,CFEqual(previews[0],matching[0]) else{finish("held","unknown_room_preview_ambiguous_or_changed")}
  }
+ let scan:[String:Any]=["chat_name":actualName,"trigger_sha256":triggerDigest,"room_name_verified":roomNameVerified,"rows":rows.count,"verified_at":Date().timeIntervalSince1970]
+ if let data=try? JSONSerialization.data(withJSONObject:scan) {
+  try? data.write(to:listScanURL,options:.atomic)
+  try? FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:listScanURL.path)
+ }
+ stamp("list_scanned")
 }
 if p["probe"] as? Bool == true && p["close_probe"] as? Bool == true {
  let target=windowList().filter{str($0,kAXTitleAttribute)==name}
@@ -166,6 +194,7 @@ if p["probe"] as? Bool == true && p["close_probe"] as? Bool == true {
 }
 var candidates=findCandidates()
 if candidates.isEmpty {
+ openedFromList=true
  let main=windowList().filter{str($0,kAXTitleAttribute)=="카카오톡"}
  guard main.count==1 else{finish("held","chat_list_window_missing_or_ambiguous")}
  let rows=collect(main[0]).filter{$0.role==kAXRowRole}
@@ -263,7 +292,6 @@ func sameVerifiedRoom(_ expectedDraft:String)->Bool {
  // The globally foreground app may be unrelated; it is not a routing authority.
  return true
 }
-let before=nodes.filter{$0.value==reply && !$0.isComposer}.count
 var backupURL:URL?=nil
 if !originalDraft.isEmpty {
  let dir=senderState.appendingPathComponent("draft-backups")
@@ -305,36 +333,14 @@ func performAttachment(_ path:String){
    return node.role==kAXStaticTextRole || node.role==kAXImageRole
   }.count
  }
- func outgoingImageBubbleCount()->Int {
-  let posValue=attr(win,kAXPositionAttribute),sizeValue=attr(win,kAXSizeAttribute)
-  guard let posValue,let sizeValue,CFGetTypeID(posValue)==AXValueGetTypeID(),CFGetTypeID(sizeValue)==AXValueGetTypeID() else{return 0}
-  var origin=CGPoint.zero,size=CGSize.zero
-  guard AXValueGetValue(posValue as! AXValue,.cgPoint,&origin),AXValueGetValue(sizeValue as! AXValue,.cgSize,&size),size.width>0 else{return 0}
-  let tables=collect(win).filter{$0.role==kAXTableRole}
-  guard tables.count==1,let rows=attr(tables[0].element,"AXRows") as? [AXUIElement] else{return 0}
-  return rows.filter{row in
-   let nodes=collect(row)
-   guard nodes.contains(where:{$0.role==kAXButtonRole && ($0.title=="공유" || $0.description=="공유")}),
-         !nodes.contains(where:{$0.role==kAXTextAreaRole || ($0.value+$0.title+$0.description).contains("유효기간")}) else{return false}
-   return nodes.contains{node in
-    guard node.role==kAXImageRole,let pv=attr(node.element,kAXPositionAttribute),let sv=attr(node.element,kAXSizeAttribute),CFGetTypeID(pv)==AXValueGetTypeID(),CFGetTypeID(sv)==AXValueGetTypeID() else{return false}
-    var p=CGPoint.zero,s=CGSize.zero
-    guard AXValueGetValue(pv as! AXValue,.cgPoint,&p),AXValueGetValue(sv as! AXValue,.cgSize,&s),s.width>16,s.height>16 else{return false}
-    // Actual Kakao image bubbles expose no filename. Require the outgoing/right alignment,
-    // a share control and no text/file payload, after the verified filename preview.
-    return p.x>origin.x+size.width*0.2 && p.x+s.width>origin.x+size.width*0.8 && p.x+s.width<=origin.x+size.width+2
-   }
-  }.count
- }
  func uploadPreviewVisible()->Bool {
   let sheets=attr(win,"AXSheets") as? [AXUIElement] ?? []
-  let tree=(sheets.isEmpty ? [win] : sheets).flatMap{collect($0)}
+  let tree=(sheets.isEmpty ? [win] : sheets).flatMap{collect($0,visibleRowsOnly:true)}
   let hasName=tree.contains{($0.value+$0.title+$0.description).contains(file.lastPathComponent)}
   let hasSend=tree.contains{$0.role==kAXButtonRole && ($0.title=="1개 전송" || $0.description=="1개 전송")}
   return hasName && hasSend
  }
- let beforeMarkers=filenameMarkerCount()
- let beforeImages=kind=="image" ? outgoingImageBubbleCount():0
+ let beforeMarkers=kind=="zip" ? filenameMarkerCount():0
  let clipboard=NSPasteboard.general
  let saved=clipboard.pasteboardItems?.map{item in
   item.types.reduce(into:[NSPasteboard.PasteboardType:Data]()){result,type in
@@ -364,7 +370,7 @@ func performAttachment(_ path:String){
  while Date()<previewDeadline {
   Thread.sleep(forTimeInterval:0.1)
   let sheets=attr(win,"AXSheets") as? [AXUIElement] ?? []
-  let previewNodes:[Node]=sheets.isEmpty ? collect(win) : sheets.flatMap{collect($0)}
+  let previewNodes:[Node]=sheets.isEmpty ? collect(win,visibleRowsOnly:true) : sheets.flatMap{collect($0)}
   if previewNodes.contains(where:{($0.value+$0.title+$0.description).contains(file.lastPathComponent)}) {
    let sends=previewNodes.filter{$0.role==kAXButtonRole && ($0.title=="1개 전송" || $0.description=="1개 전송") && $0.enabled}
    if sends.count==1 {uploadButton=sends[0].element;break}
@@ -377,10 +383,24 @@ func performAttachment(_ path:String){
  stamp("before_attachment_send")
  requireUnexpired()
  guard postKeyboardKey(36) else{finish("sending","attachment_enter_outcome_uncertain")}
+ if kind=="image" {
+  // Kakao image bubbles expose no filename and bubble geometry proved unreliable. Enter was
+  // pressed on the verified "1개 전송" button of this room, so the upload sheet closing while
+  // the same window stays in place is the bounded completion signal.
+  let imageDeadline=Date().addingTimeInterval(6)
+  while Date()<imageDeadline {
+   Thread.sleep(forTimeInterval:0.1)
+   let named=windowList().filter{str($0,kAXTitleAttribute)==actualName}
+   if named.count==1 && CFEqual(named[0],win) && !uploadPreviewVisible() {
+    attachmentSent=true;attachmentVerification="upload_sheet_closed";stamp("attachment_verified");return
+   }
+  }
+  finish("sending","attachment_delivery_not_observed")
+ }
  let deadline=Date().addingTimeInterval(35)
  while Date()<deadline {
   Thread.sleep(forTimeInterval:0.15)
-  if str(win,kAXTitleAttribute)==actualName && sameVerifiedRoom(originalDraft) && !uploadPreviewVisible() && (filenameMarkerCount()>beforeMarkers || kind=="image" && outgoingImageBubbleCount()>beforeImages) {
+  if str(win,kAXTitleAttribute)==actualName && sameVerifiedRoom(originalDraft) && !uploadPreviewVisible() && filenameMarkerCount()>beforeMarkers {
    attachmentSent=true;stamp("attachment_verified");return
   }
  }
@@ -405,13 +425,18 @@ guard str(win,kAXTitleAttribute)==actualName,str(editor,kAXValueAttribute)==repl
 guard AXUIElementSetAttributeValue(editor,kAXFocusedAttribute as CFString,kCFBooleanTrue) == .success,
       let textFocused=attr(root,kAXFocusedUIElementAttribute),CFEqual(textFocused,editor),
       str(editor,kAXValueAttribute)==reply,sameVerifiedRoom(reply) else{finish("sending","composer_focus_or_target_changed")}
+// Own sends scroll the room to the bottom, so the new bubble is among the visible rows; counting
+// only those keeps each check cheap while Kakao is busy right after Enter.
+func visibleReplyCount()->Int {collect(win,visibleRowsOnly:true).filter{$0.value==reply && !$0.isComposer}.count}
+let before=visibleReplyCount()
 stamp("before_send")
 requireUnexpired()
 guard postKeyboardKey(36) else{finish("sending","text_enter_event_creation_failed")}
-for _ in 0..<20 {
- Thread.sleep(forTimeInterval:0.1)
+let sentDeadline=Date().addingTimeInterval(8)
+while Date()<sentDeadline {
+ Thread.sleep(forTimeInterval:0.05)
  if str(win,kAXTitleAttribute)==actualName && str(editor,kAXValueAttribute).isEmpty {
-  if collect(win).filter({$0.value==reply && !$0.isComposer}).count>before {
+  if visibleReplyCount()>before {
    textSent=true;stamp("sent_verified");restoreDraft()
    if let path=p["attachment_path"] as? String {performAttachment(path)}
    finish("sent_verified",draftRestored ? "":"draft_saved_for_recovery")

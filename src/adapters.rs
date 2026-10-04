@@ -39,13 +39,36 @@ impl Adapter for Kakao {
         if !plan.reply.starts_with(crate::event::PREFIX) {
             bail!("invalid_reply_prefix")
         }
-        expressions::validate_plan(plan, &expressions::candidates(&self.cfg, store, e)?)?;
+        expressions::validate_plan(plan)?;
         let route = store.route(&e.conversation)?;
         let name = route.as_deref().unwrap_or(&e.title);
         if name.is_empty() {
             return Ok(json!({"status":"held","reason":"missing_target"}));
         }
         let mut p = json!({"chat_name":name,"room_name_verified":route.is_some(),"trigger_body":e.body,"reply":plan.reply,"expires_at":crate::event::now()+75.0});
+        // Staging is local only; the sender pastes the image after the text receipt in the same run,
+        // so the second launch and second target scan of a separate attachment request disappear.
+        let mut sticker = Value::Null;
+        if let Some(id) = &plan.sticker_id {
+            let cfg = self.cfg.clone();
+            let (job, selected) = (key.to_owned(), id.clone());
+            let staged =
+                tokio::task::spawn_blocking(move || expressions::prepare(&cfg, &job, &selected))
+                    .await;
+            // A sticker is decoration: any staging problem degrades to a text-only reply.
+            if let Ok(Ok(mut artifact)) = staged
+                && store.reserve_expression(
+                    key,
+                    &e.conversation,
+                    artifact["sha256"].as_str().unwrap(),
+                    artifact["family"].as_str().unwrap(),
+                )?
+            {
+                p["attachment_path"] = artifact["path"].clone();
+                artifact.as_object_mut().unwrap().remove("path");
+                sticker = artifact;
+            }
+        }
         if let Some(id) = &plan.bundle_id {
             // Pure staging work may be blocking; no UI/model call occurs during ZIP processing.
             let cfg = self.cfg.clone();
@@ -63,6 +86,9 @@ impl Adapter for Kakao {
             p["attachment_path"] = artifact["path"].clone();
         }
         let mut result = self.native_request(&p).await?;
+        if !sticker.is_null() && settle_sticker(&mut result, sticker) {
+            store.verify_expression(key)?;
+        }
         validate_receipt(
             &mut result,
             route.as_deref().unwrap_or(""),
@@ -75,61 +101,37 @@ impl Adapter for Kakao {
             store.save_route(&e.conversation, name)?;
         }
         store.note_intro(&e.conversation, &plan.reply, &result)?;
-        if let Some(id) = &plan.sticker_id {
-            // No image extraction, staging or UI side effect before a verified text receipt.
-            if result["status"] != "sent_verified" {
-                return Ok(result);
-            }
-            let cfg = self.cfg.clone();
-            let job = key.to_owned();
-            let selected = id.clone();
-            let artifact = match tokio::task::spawn_blocking(move || {
-                expressions::prepare(&cfg, &job, &selected)
-            })
-            .await
-            {
-                Ok(Ok(v)) => v,
-                _ => {
-                    return Ok(
-                        json!({"status":"partial_file_held","reason":"sticker_preparation_failed","text_sent":true,"attachment_sent":false,"text_receipt":result}),
-                    );
-                }
-            };
-            if !store.reserve_expression(
-                key,
-                &e.conversation,
-                artifact["sha256"].as_str().unwrap(),
-                artifact["family"].as_str().unwrap(),
-            )? {
-                return Ok(
-                    json!({"status":"partial_file_held","reason":"sticker_attempt_already_recorded","text_sent":true,"attachment_sent":false,"text_receipt":result}),
-                );
-            }
-            let verified_name = result["verified_chat_name"].as_str().unwrap();
-            let request = json!({"chat_name":verified_name,"room_name_verified":true,"trigger_body":e.body,
-                "reply":plan.reply,"phase":"attachment_only","prior_text_verified":true,
-                "attachment_path":artifact["path"],"expires_at":crate::event::now()+75.0});
-            let mut image = match self.native_request(&request).await {
-                Ok(v) => v,
-                Err(_) => {
-                    json!({"status":"sending_uncertain","reason":"attachment_transport_uncertain"})
-                }
-            };
-            validate_receipt(&mut image, verified_name, true);
-            if image["status"] == "sent_verified" {
-                store.verify_expression(key)?;
-            } else if image["status"] == "held" {
-                image["status"] = json!("partial_file_held");
-            }
-            image["text_sent"] = json!(true);
-            image["text_receipt"] = result;
-            let mut metadata = artifact;
-            metadata.as_object_mut().unwrap().remove("path");
-            image["sticker"] = metadata;
-            return Ok(image);
-        }
         Ok(result)
     }
+}
+impl Kakao {
+    /// Runs the sender's full target verification without writing anything, so the scan of the
+    /// chat list overlaps model inference and the following send reuses its fresh result.
+    pub async fn prewarm(&self, store: &Store, e: &Event) -> Result<Value> {
+        let route = store.route(&e.conversation)?;
+        let name = route.as_deref().unwrap_or(&e.title);
+        if name.is_empty() {
+            return Ok(json!({"status":"held","reason":"missing_target"}));
+        }
+        self.native_request(
+            &json!({"chat_name":name,"room_name_verified":route.is_some(),"trigger_body":e.body,
+            "reply":crate::event::PREFIX,"probe":true,"expires_at":crate::event::now()+75.0}),
+        )
+        .await
+    }
+}
+/// A sticker is decoration: once the text is verified the reply counts as delivered, and an
+/// unverified image is only recorded on the receipt. Returns whether the image was verified.
+pub fn settle_sticker(result: &mut Value, mut sticker: Value) -> bool {
+    let image_sent = result["status"] == "sent_verified" && result["attachment_sent"] == true;
+    sticker["sent"] = json!(image_sent);
+    if !image_sent && result["text_sent"] == true {
+        sticker["outcome"] = json!({"status":result["status"],"reason":result["reason"]});
+        result["status"] = json!("sent_verified");
+        result["reason"] = json!("sticker_not_verified");
+    }
+    result["sticker"] = sticker;
+    image_sent
 }
 fn validate_receipt(result: &mut Value, expected: &str, attachment: bool) {
     if result["status"] == "sending" {

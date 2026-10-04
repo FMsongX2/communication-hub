@@ -30,9 +30,6 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExpressionConfig {
     pub catalog: PathBuf,
-    /// GIF delivery is disabled until animation preservation is verified on this installation.
-    #[serde(default)]
-    pub gif_verified: bool,
     #[serde(default)]
     pub emoticons: Option<PathBuf>,
 }
@@ -59,6 +56,10 @@ pub struct KakaoConfig {
     pub receiver_app: PathBuf,
     pub sender_app: PathBuf,
     pub sender_ipc: PathBuf,
+    /// Probe the target while the model runs. Only pays off with a sender that reuses the probe's
+    /// chat-list scan; with an older sender it delays the final send instead.
+    #[serde(default)]
+    pub prewarm: bool,
 }
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
@@ -75,7 +76,7 @@ impl Config {
     }
     pub fn descriptors(&self) -> Value {
         json!([
-            {"provider":"kakao","enabled":self.kakao.enabled,"kind":"chat","transport":"macos_notification_and_ax","capabilities":["receive_calls","reply_text","approved_bundle_attachment","approved_sticker_attachment"],"sticker_catalog_configured":self.expressions.is_some(),"gif_auto_enabled":self.expressions.as_ref().is_some_and(|c| c.gif_verified),"attachment_live_verified":false,"uses_pointer":false},
+            {"provider":"kakao","enabled":self.kakao.enabled,"kind":"chat","transport":"macos_notification_and_ax","capabilities":["receive_calls","reply_text","approved_bundle_attachment","approved_sticker_attachment"],"sticker_catalog_configured":self.expressions.is_some(),"sticker_formats":["PNG"],"attachment_live_verified":false,"uses_pointer":false},
             {"provider":"discord","enabled":false,"kind":"chat","status":"adapter_not_implemented","capabilities":[]},
             {"provider":"slack","enabled":false,"kind":"chat","status":"adapter_not_implemented","capabilities":[]},
             {"provider":"notion","enabled":false,"kind":"documents_and_comments","status":"adapter_not_implemented","capabilities":[]}

@@ -69,6 +69,10 @@ if !doctor && (receiverLock<0 || flock(receiverLock,LOCK_EX|LOCK_NB) != 0){exit(
     return [:]
 }
 var seen = Set<String>()
+// Only records newer than the last fully handled one are read and decoded, which keeps a short
+// poll interval cheap. A failed hand-off stops the cursor there so that record is read again.
+var cursor: Int64 = 0
+var lastStatusAt = Date.distantPast
 func poll() {
     var db: OpaquePointer?
     guard sqlite3_open_v2(database.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
@@ -78,11 +82,12 @@ func poll() {
     defer { sqlite3_close(db) }
     sqlite3_busy_timeout(db, 2000)
     var statement: OpaquePointer?
-    let query = "SELECT r.rec_id,r.data FROM record r JOIN app a ON r.app_id=a.app_id WHERE lower(a.identifier)='com.kakao.kakaotalkmac' AND r.data IS NOT NULL ORDER BY r.rec_id DESC LIMIT 256"
+    let query = "SELECT r.rec_id,r.data FROM record r JOIN app a ON r.app_id=a.app_id WHERE lower(a.identifier)='com.kakao.kakaotalkmac' AND r.data IS NOT NULL AND r.rec_id>? ORDER BY r.rec_id DESC LIMIT 256"
     guard sqlite3_prepare_v2(db, query, -1, &statement, nil) == SQLITE_OK else {
         emit(["kind":"source_status","status":"schema_unavailable","at":Date().timeIntervalSince1970]); return
     }
     defer { sqlite3_finalize(statement) }
+    sqlite3_bind_int64(statement, 1, doctor ? 0 : cursor)
     var rows: [(Int64, Data)] = []
     while sqlite3_step(statement) == SQLITE_ROW {
         let id=sqlite3_column_int64(statement,0), size=sqlite3_column_bytes(statement,1)
@@ -96,7 +101,9 @@ func poll() {
         emit(["kind":"source_status","status":"notification_store_readable","kakao_retained_count":rows.count,"field_shapes_only":fields]); return
     }
     var retained=Set<String>()
-    for (_,data) in rows.reversed() {
+    var advancing=true
+    for (id,data) in rows.reversed() {
+        defer { if advancing { cursor=max(cursor,id) } }
         guard let root=(try? PropertyListSerialization.propertyList(from:data,options:[],format:nil)) as? [String:Any], let req=root["req"] as? [String:Any], let identity=req["iden"] as? String else {continue}
         let parts=identity.split(separator:"_")
         guard parts.count==2,Int64(parts[0]) != nil,Int64(parts[1]) != nil else {continue}
@@ -113,16 +120,19 @@ func poll() {
         for (key,value) in req where key.lowercased().contains("mention") {
             if value is String || value is NSNumber {mention[key]=value}
         }
-        if !emit(["source":"kakao_notification_store","room_id":String(parts[0]),"message_id":String(parts[1]),"body":req["body"] as? String ?? "","chat_name":req["titl"] as? String ?? "","occurred_at":occurred,"mention_metadata":mention,"sender_identity":"unverified"]){seen.remove(identity)}
+        if !emit(["source":"kakao_notification_store","room_id":String(parts[0]),"message_id":String(parts[1]),"body":req["body"] as? String ?? "","chat_name":req["titl"] as? String ?? "","occurred_at":occurred,"mention_metadata":mention,"sender_identity":"unverified"]){seen.remove(identity);advancing=false}
     }
     if seen.count>4096 {seen.formIntersection(retained)}
-    emit(["kind":"source_status","status":"watching_kakao_only","at":Date().timeIntervalSince1970])
+    // Heartbeat for the hub's 15-second liveness check, decoupled from the poll rate.
+    if Date().timeIntervalSince(lastStatusAt)>=5 {
+        if emit(["kind":"source_status","status":"watching_kakao_only","at":Date().timeIntervalSince1970]) {lastStatusAt=Date()}
+    }
 }
 if doctor {poll();exit(0)}
 let app=NSApplication.shared
 app.setActivationPolicy(.accessory)
 poll()
-let timer=Timer.scheduledTimer(withTimeInterval:3,repeats:true) { _ in
+let timer=Timer.scheduledTimer(withTimeInterval:0.5,repeats:true) { _ in
     poll()
 }
 RunLoop.main.add(timer,forMode:.common)

@@ -40,7 +40,7 @@ enum Command {
         #[arg(long)]
         file: PathBuf,
     },
-    ExpressionCandidates {
+    ExpressionPick {
         #[arg(long)]
         file: PathBuf,
     },
@@ -135,10 +135,14 @@ async fn execute() -> Result<()> {
         Command::Ingest { file } => {
             daemon::request(&cfg.socket, json!({"method":"ingest","event":load(&file)?})).await?
         }
-        Command::ExpressionCandidates { file } => {
+        Command::ExpressionPick { file } => {
             let e = load(&file)?;
             cfg.validate_channel(&e.conversation.provider, &e.conversation.account)?;
-            communication_hub::expressions::candidates(&cfg, &Store::open(cfg.state.clone())?, &e)?
+            json!(communication_hub::expressions::pick(
+                &cfg,
+                &Store::open(cfg.state.clone())?,
+                &e
+            )?)
         }
         Command::ModelSmoke { file } => {
             if cfg.external_auto_send || cfg.dispatch_enabled {

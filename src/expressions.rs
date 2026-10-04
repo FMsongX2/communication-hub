@@ -1,4 +1,4 @@
-//! Operator-owned catalogs. Models select IDs, never arbitrary filesystem paths.
+//! Operator-owned catalogs. Code picks catalog IDs, never arbitrary filesystem paths.
 use crate::{
     config::{Config, private_dir},
     event::{Event, Plan, digest},
@@ -69,83 +69,37 @@ fn catalog(cfg: &Config) -> Result<Vec<Sticker>> {
     }
     Ok(cat.items)
 }
-/// Bound input cost. Lexical ranking only nominates candidates: the model still checks meaning,
-/// relationship and all avoid conditions. Restricted memes are not automatically nominated.
-pub fn candidates(cfg: &Config, store: &Store, e: &Event) -> Result<Value> {
-    let history = store.expression_history(&e.conversation)?;
-    let recent: HashSet<_> = history.iter().map(|(sha, _)| sha.as_str()).collect();
-    let families: HashSet<_> = history.iter().take(6).map(|(_, f)| f.as_str()).collect();
-    let body = e
-        .body
-        .replace("@[유이]", "")
-        .replace("[유이]", "")
-        .to_lowercase();
-    let chars: Vec<_> = body.chars().collect();
-    let grams: HashSet<String> = chars
-        .windows(2)
-        .filter(|w| w.iter().all(|c| c.is_alphanumeric()))
-        .map(|w| w.iter().collect())
+fn eligible(row: &Sticker) -> bool {
+    // Only static PNGs are sent; GIF delivery is not used.
+    row.format == "PNG"
+}
+/// Code-side uniform random pick over every PNG: no model tokens or latency are spent on it.
+/// Only the room's recent images are skipped.
+pub fn pick(cfg: &Config, store: &Store, e: &Event) -> Result<Option<String>> {
+    if cfg.expressions.is_none() {
+        return Ok(None);
+    }
+    let recent: HashSet<_> = store
+        .expression_history(&e.conversation)?
+        .into_iter()
+        .map(|(sha, _)| sha)
         .collect();
     let mut seen = HashSet::new();
-    let mut scored = Vec::new();
-    for row in catalog(cfg)? {
-        if !row.random_eligible
-            || recent.contains(row.sha256.as_str())
-            || !seen.insert(row.sha256.clone())
-            || row.format == "GIF" && !cfg.expressions.as_ref().is_some_and(|c| c.gif_verified)
-        {
-            continue;
-        }
-        let meaning = format!(
-            "{} {} {}",
-            row.category,
-            row.visual_meaning,
-            row.suitable_situations.join(" ")
-        )
-        .to_lowercase();
-        let score = grams
-            .iter()
-            .filter(|g| meaning.contains(g.as_str()))
-            .count() as i32
-            * 10
-            - if families.contains(row.category.as_str()) {
-                5
-            } else {
-                0
-            };
-        let tie = digest(format!("{}:{}", e.key(), row.id));
-        scored.push((score, tie, row));
+    let pool: Vec<Sticker> = catalog(cfg)?
+        .into_iter()
+        .filter(|row| {
+            eligible(row) && !recent.contains(&row.sha256) && seen.insert(row.sha256.clone())
+        })
+        .collect();
+    if pool.is_empty() {
+        return Ok(None);
     }
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    // Keep strong lexical matches, then diversify the remaining category coverage.
-    let mut picked = Vec::new();
-    let mut counts = std::collections::HashMap::new();
-    for (score, _, row) in scored {
-        let count = counts.entry(row.category.clone()).or_insert(0);
-        if score <= 0 && *count >= 3 {
-            continue;
-        }
-        *count += 1;
-        picked.push(
-            json!({"id":row.id,"family":row.category,"meaning":row.visual_meaning,
-            "suitable":row.suitable_situations,"avoid":row.avoid_context,"format":row.format}),
-        );
-        if picked.len() == 32 {
-            break;
-        }
-    }
-    Ok(json!(picked))
+    let roll = u64::from_str_radix(&crate::adapters::nonce()?[..16], 16)?;
+    Ok(Some(pool[(roll % pool.len() as u64) as usize].id.clone()))
 }
-pub fn validate_plan(plan: &Plan, offered: &Value) -> Result<()> {
+pub fn validate_plan(plan: &Plan) -> Result<()> {
     if plan.bundle_id.is_some() && plan.sticker_id.is_some() {
         bail!("multiple_attachment_types")
-    }
-    if plan.sticker_id.as_ref().is_some_and(|id| {
-        !offered
-            .as_array()
-            .is_some_and(|a| a.iter().any(|v| v["id"] == *id))
-    }) {
-        bail!("sticker_not_offered")
     }
     Ok(())
 }
@@ -177,9 +131,7 @@ pub fn prepare(cfg: &Config, key: &str, id: &str) -> Result<Value> {
         .into_iter()
         .find(|r| r.id == id)
         .ok_or_else(|| anyhow::anyhow!("unknown_sticker"))?;
-    if !row.random_eligible
-        || row.format == "GIF" && !cfg.expressions.as_ref().is_some_and(|c| c.gif_verified)
-    {
+    if !eligible(&row) {
         bail!("sticker_not_enabled")
     }
     let root = fs::canonicalize(cfg.expressions.as_ref().unwrap().catalog.parent().unwrap())?;
@@ -205,12 +157,7 @@ pub fn prepare(cfg: &Config, key: &str, id: &str) -> Result<Value> {
     if data.len() as u64 > MAX_IMAGE || digest(&data) != row.sha256 {
         bail!("sticker_hash_mismatch")
     }
-    let valid = match suffix {
-        "png" => data.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "gif" => data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a"),
-        _ => false,
-    };
-    if !valid {
+    if suffix != "png" || !data.starts_with(b"\x89PNG\r\n\x1a\n") {
         bail!("sticker_signature_mismatch")
     }
     private_dir(&cfg.kakao.sender_ipc)?;

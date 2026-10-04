@@ -46,6 +46,7 @@ fn config(root: &Path) -> Config {
             receiver_app: root.join("receiver.app"),
             sender_app: root.join("sender.app"),
             sender_ipc: root.join("ipc"),
+            prewarm: false,
         },
     }
 }
@@ -950,67 +951,58 @@ fn expression_fixture(t: &TempDir) -> (Config, Vec<u8>) {
     zip.start_file("original.gif", SimpleFileOptions::default())
         .unwrap();
     zip.write_all(&gif).unwrap();
+    zip.start_file("restricted.png", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(b"\x89PNG\r\n\x1a\nrestricted").unwrap();
     zip.finish().unwrap();
-    let row = |id: &str, data: &[u8], format: &str, eligible: bool| json!({"id":id,"category":"인사","visual_meaning":"반가운 인사","suitable_situations":["인사"],"avoid_context":["슬픈 소식"],"random_eligible":eligible,"format":format,"sha256":communication_hub::event::digest(data),"archive":"pictures.zip","archive_path":format!("original.{}",format.to_lowercase())});
-    std::fs::write(assets.join("catalog.json"),serde_json::to_vec(&json!({"items":[row("one",&png,"PNG",true),row("duplicate",&png,"PNG",true),row("animated",&gif,"GIF",true),row("restricted",b"different","PNG",false)]})).unwrap()).unwrap();
+    let row = |id: &str, data: &[u8], format: &str, eligible: bool| json!({"id":id,"category":"인사","visual_meaning":"반가운 인사","suitable_situations":["인사"],"avoid_context":["슬픈 소식"],"random_eligible":eligible,"format":format,"sha256":communication_hub::event::digest(data),"archive":"pictures.zip","archive_path":if eligible {format!("original.{}",format.to_lowercase())} else {"restricted.png".into()}});
+    std::fs::write(assets.join("catalog.json"),serde_json::to_vec(&json!({"items":[row("one",&png,"PNG",true),row("duplicate",&png,"PNG",true),row("animated",&gif,"GIF",true),row("restricted",b"\x89PNG\r\n\x1a\nrestricted","PNG",false)]})).unwrap()).unwrap();
     cfg.expressions = Some(communication_hub::config::ExpressionConfig {
         catalog: assets.join("catalog.json"),
-        gif_verified: false,
         emoticons: None,
     });
     (cfg, png)
 }
 #[test]
-fn expression_candidates_deduplicate_and_respect_room_scoped_cooldown() {
-    use communication_hub::expressions;
+fn expression_pick_is_png_only_random_and_respects_room_scoped_cooldown() {
+    use communication_hub::{event::digest, expressions};
     let t = TempDir::new().unwrap();
     let (cfg, png) = expression_fixture(&t);
     let s = Store::open(cfg.state.clone()).unwrap();
     let e = event();
-    let candidates = expressions::candidates(&cfg, &s, &e).unwrap();
-    assert_eq!(candidates.as_array().unwrap().len(), 1);
-    assert_eq!(candidates[0]["avoid"], json!(["슬픈 소식"]));
+    let picks: std::collections::HashSet<String> = (0..64)
+        .map(|_| expressions::pick(&cfg, &s, &e).unwrap().unwrap())
+        .collect();
+    // Fully random over PNGs (restricted included), one entry per image, never the GIF.
+    assert!(!picks.contains("animated"));
+    assert!(picks.contains("restricted"));
+    assert!(picks.contains("one") ^ picks.contains("duplicate"));
+    s.reserve_expression("attempt", &e.conversation, &digest(png), "인사")
+        .unwrap();
+    assert_eq!(
+        expressions::pick(&cfg, &s, &e).unwrap().as_deref(),
+        Some("restricted")
+    );
     s.reserve_expression(
-        "attempt",
+        "attempt-2",
         &e.conversation,
-        &communication_hub::event::digest(png),
+        &digest(b"\x89PNG\r\n\x1a\nrestricted"),
         "인사",
     )
     .unwrap();
-    assert!(
-        expressions::candidates(&cfg, &s, &e)
-            .unwrap()
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(expressions::pick(&cfg, &s, &e).unwrap(), None);
     let mut other = e.clone();
     other.conversation.id = "other-room".into();
-    assert_eq!(
-        expressions::candidates(&cfg, &s, &other)
-            .unwrap()
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert!(
-        !s.reserve_expression("attempt", &e.conversation, "other", "other")
-            .unwrap()
-    );
-    assert!(
-        expressions::candidates(&cfg, &s, &e)
-            .unwrap()
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
+    assert!(expressions::pick(&cfg, &s, &other).unwrap().is_some());
+    let mut none = cfg.clone();
+    none.expressions = None;
+    assert_eq!(expressions::pick(&none, &s, &other).unwrap(), None);
 }
 #[test]
-fn expression_preparation_preserves_bytes_and_rejects_unverified_gif() {
+fn expression_preparation_preserves_bytes_and_never_sends_gif() {
     use communication_hub::{event::digest, expressions};
     let t = TempDir::new().unwrap();
-    let (mut cfg, png) = expression_fixture(&t);
+    let (cfg, png) = expression_fixture(&t);
     let key = digest("fixture");
     let result = expressions::prepare(&cfg, &key, "one").unwrap();
     assert_eq!(
@@ -1018,13 +1010,7 @@ fn expression_preparation_preserves_bytes_and_rejects_unverified_gif() {
         png
     );
     assert!(expressions::prepare(&cfg, &key, "animated").is_err());
-    cfg.expressions.as_mut().unwrap().gif_verified = true;
-    let gif = expressions::prepare(&cfg, &key, "animated").unwrap();
-    assert_eq!(
-        std::fs::read(gif["path"].as_str().unwrap()).unwrap(),
-        b"GIF89afixture"
-    );
-    assert!(expressions::prepare(&cfg, &key, "restricted").is_err());
+    assert!(expressions::prepare(&cfg, &key, "restricted").is_ok());
     assert!(expressions::prepare(&cfg, "../../invalid", "one").is_err());
 }
 #[test]
@@ -1042,17 +1028,16 @@ fn expression_catalog_rejects_hash_and_path_changes() {
     assert!(expressions::prepare(&cfg, &digest("fixture"), "one").is_err());
 }
 #[test]
-fn expression_plan_cannot_select_unoffered_or_multiple_attachments() {
+fn expression_plan_cannot_carry_bundle_and_sticker_together() {
     use communication_hub::expressions;
-    let offered = json!([{"id":"one"}]);
     let mut p = Plan {
         reply: "[System-유이] : hello".into(),
         bundle_id: None,
         sticker_id: Some("one".into()),
     };
-    expressions::validate_plan(&p, &offered).unwrap();
-    p.sticker_id = Some("not-offered".into());
-    assert!(expressions::validate_plan(&p, &offered).is_err());
+    expressions::validate_plan(&p).unwrap();
+    p.bundle_id = Some("bundle".into());
+    assert!(expressions::validate_plan(&p).is_err());
     assert!(
         Plan::parse(
             r#"{"reply":"[System-유이] : hello","bundle_id":"bundle","sticker_id":"one"}"#,
@@ -1060,6 +1045,23 @@ fn expression_plan_cannot_select_unoffered_or_multiple_attachments() {
         )
         .is_err()
     );
+}
+#[test]
+fn sticker_failure_never_makes_a_verified_text_reply_uncertain() {
+    use communication_hub::adapters::settle_sticker;
+    let sticker = json!({"sticker_id":"one"});
+    let mut both = json!({"status":"sent_verified","text_sent":true,"attachment_sent":true});
+    assert!(settle_sticker(&mut both, sticker.clone()));
+    assert_eq!(both["sticker"]["sent"], true);
+    let mut image_lost = json!({"status":"sending","reason":"attachment_delivery_not_observed","text_sent":true,"attachment_sent":false});
+    assert!(!settle_sticker(&mut image_lost, sticker.clone()));
+    assert_eq!(image_lost["status"], "sent_verified");
+    assert_eq!(image_lost["sticker"]["outcome"]["status"], "sending");
+    // Text never verified: the native status is kept as is.
+    let mut text_lost =
+        json!({"status":"sending","reason":"text_enter_delivery_not_observed","text_sent":false});
+    assert!(!settle_sticker(&mut text_lost, sticker));
+    assert_eq!(text_lost["status"], "sending");
 }
 #[cfg(unix)]
 #[test]
@@ -1088,4 +1090,17 @@ fn wire_prefix_is_generated_once_for_new_and_legacy_model_output() {
     );
     assert!(format_reply("[System-유이] : ").is_err());
     assert!(format_reply(&"x".repeat(8192)).is_err());
+}
+#[test]
+fn concurrent_ack_intro_suppresses_a_second_intro_in_the_final_reply() {
+    let t = TempDir::new().unwrap();
+    let c = config(t.path());
+    let s = Store::open(c.state.clone()).unwrap();
+    let marker = "이 방에는 자기소개를 실제 전송한 기록이 있어";
+    let (plain, _, _) = worker::instructions(&c, &s, &event(), false).unwrap();
+    let (with_ack, _, _) = worker::instructions(&c, &s, &event(), true).unwrap();
+    assert!(!plain.contains(marker));
+    assert!(with_ack.contains(marker));
+    // The model is told the runner attaches stickers, so it never picks or mentions one.
+    assert!(!plain.contains("sticker_id"));
 }
