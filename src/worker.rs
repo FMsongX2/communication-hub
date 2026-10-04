@@ -319,25 +319,8 @@ pub async fn deliver(
 }
 /// Sent at once to a caller whose call has to wait behind another one.
 pub const BUSY_TEXT: &str = "우웅.. 일하고 있엉.. 조금만 기다려줘! (ෆ˙ᵕ˙ෆ)♡";
-const BUSY_ROOM_INTERVAL: f64 = 60.0;
 fn busy_key(e: &Event) -> String {
     digest(format!("busy:{}", e.key()))
-}
-/// Claims the room's busy-notice slot: at most one notice per room per minute, decided at intake so
-/// that calls arriving together cannot both pass the check.
-pub fn claim_busy_slot(e: &Event) -> bool {
-    static SENT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, f64>>> =
-        std::sync::OnceLock::new();
-    let mut sent = SENT.get_or_init(Default::default).lock().unwrap();
-    let room = e.conversation.key();
-    if sent
-        .get(&room)
-        .is_some_and(|t| now() - t < BUSY_ROOM_INTERVAL)
-    {
-        return false;
-    }
-    sent.insert(room, now());
-    true
 }
 /// A fixed reply plus a code-picked sticker: no model is involved, so it goes out within seconds.
 pub async fn notify_busy(cfg: &Config, store: &Store, e: &Event) -> Result<Value> {

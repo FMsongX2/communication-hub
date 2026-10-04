@@ -263,6 +263,7 @@ fn validate_receipt(result: &mut Value, expected: &str, attachment: bool) {
         *result = json!({"status":"sending_uncertain","reason":"native_target_mismatch"});
     }
 }
+const ATTACHMENT_SETTLE: Duration = Duration::from_secs(2);
 /// One KakaoTalk UI operation at a time: a busy notice, a probe and a reply never interleave.
 fn ui_lock() -> &'static tokio::sync::Mutex<()> {
     static UI: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -279,6 +280,11 @@ impl Kakao {
         let receipt = base.join("sender-receipts").join(format!("{request}.json"));
         let result = self.invoke_sender(&request, &receipt).await;
         let _ = std::fs::remove_file(path);
+        // An image is still uploading when its preview closes. Holding the queue briefly keeps the
+        // next text from reaching KakaoTalk's server first, so each text stays next to its sticker.
+        if result.as_ref().is_ok_and(|r| r["attachment_sent"] == true) {
+            tokio::time::sleep(ATTACHMENT_SETTLE).await;
+        }
         result
     }
     async fn invoke_sender(&self, request: &str, receipt: &Path) -> Result<Value> {

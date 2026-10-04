@@ -339,7 +339,7 @@ fn ingest(
             }
             Ok(()) if store.enqueue(&e)? => {
                 queued = true;
-                if working && cfg.external_auto_send && crate::worker::claim_busy_slot(&e) {
+                if working && cfg.external_auto_send {
                     let (cfg, store, e) = (cfg.clone(), store.clone(), e.clone());
                     tokio::spawn(async move {
                         let _ = crate::worker::notify_busy(&cfg, &store, &e).await;

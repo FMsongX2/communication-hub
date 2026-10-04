@@ -1537,20 +1537,12 @@ fn context_reset_hides_earlier_exchanges_and_approval_initializes_the_room() {
     assert!(recent[0].0.contains("after"));
 }
 #[tokio::test]
-async fn busy_notice_is_a_fixed_reply_once_per_room_per_minute() {
+async fn busy_notice_is_a_fixed_reply_without_a_model() {
     use communication_hub::event::Agent;
     let t = TempDir::new().unwrap();
     let c = config(t.path());
     let s = Store::open(c.state.clone()).unwrap();
     let e = event();
-    assert!(worker::claim_busy_slot(&e));
-    assert!(
-        !worker::claim_busy_slot(&e),
-        "a second notice within a minute"
-    );
-    let mut elsewhere = event();
-    elsewhere.conversation.id = "busy-other-room".into();
-    assert!(worker::claim_busy_slot(&elsewhere));
     // With sending off the notice is journaled but not sent; its text needs no model.
     let receipt = worker::notify_busy(&c, &s, &e.for_agent(Agent::Yumi))
         .await
