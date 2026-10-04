@@ -38,6 +38,13 @@ impl Agent {
             Agent::Yumi => "[System-유미] : ",
         }
     }
+    /// The room-registry switch that enables this sister.
+    pub fn name_key(self) -> &'static str {
+        match self {
+            Agent::Yui => "yui",
+            Agent::Yumi => "yumi",
+        }
+    }
     fn is_yui(&self) -> bool {
         *self == Agent::Yui
     }

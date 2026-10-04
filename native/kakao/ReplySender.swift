@@ -19,6 +19,7 @@ var attachmentSent=false
 var cleanupClipboard:(()->Void)?=nil
 var openTarget:[String:Any]?=nil
 var attachmentVerification:String?=nil
+var listRows:Int?=nil
 func stamp(_ key:String){
  timing[key]=Date().timeIntervalSince(startedAt)
  if let request=requestKey {
@@ -51,6 +52,7 @@ func finish(_ status:String,_ reason:String="") -> Never {
  r["text_sent"]=textSent
  r["attachment_sent"]=attachmentSent
  if let check=attachmentVerification {r["attachment_verification"]=check}
+ if let rows=listRows {r["list_rows"]=rows}
  r["elapsed_seconds"]=Date().timeIntervalSince(startedAt)
  if let key=requestKey,key.range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil {
  let output=senderState.appendingPathComponent("sender-receipts/"+key+".json")
@@ -179,6 +181,10 @@ func verifyListTarget(_ actualName:String){
  let tables=collect(main[0]).filter{$0.role==kAXTableRole}
  guard tables.count==1,let rows=attr(tables[0].element,"AXRows") as? [AXUIElement],!rows.isEmpty,rows.count<=10000 else{finish("held","complete_chat_rows_unavailable")}
  if let count=attr(tables[0].element,"AXRowCount") as? Int,count>rows.count {finish("held","chat_rows_incomplete")}
+ listRows=rows.count
+ // An owner-approved room was proven unique at this list size; unchanged size means no room was
+ // added or removed since, so the per-call scan is skipped.
+ if let expected=p["room_verified_rows"] as? Int,expected==rows.count {stamp("room_registry_verified");return}
  if reusableListScan(actualName,rows.count) {stamp("list_scan_reused");return}
  let matching=rows.filter{row in collect(row).contains{node in node.role==kAXStaticTextRole && [node.value,node.title,node.description].contains{labelMatches($0,actualName)}}}
  guard matching.count==1 else{finish("held","duplicate_or_missing_chat_name")}
@@ -192,6 +198,19 @@ func verifyListTarget(_ actualName:String){
   try? FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:listScanURL.path)
  }
  stamp("list_scanned")
+}
+// Registration check from the dashboard: prove the name is unique in the chat list without
+// opening the room or writing anything, and report the list size it was proven at.
+if p["verify_room"] as? Bool == true {
+ let main=windowList().filter{str($0,kAXTitleAttribute)=="카카오톡"}
+ guard main.count==1 else{finish("held","chat_list_window_missing_or_ambiguous")}
+ let tables=collect(main[0]).filter{$0.role==kAXTableRole}
+ guard tables.count==1,let rows=attr(tables[0].element,"AXRows") as? [AXUIElement],!rows.isEmpty,rows.count<=10000 else{finish("held","complete_chat_rows_unavailable")}
+ if let count=attr(tables[0].element,"AXRowCount") as? Int,count>rows.count {finish("held","chat_rows_incomplete")}
+ let matching=rows.filter{row in collect(row).contains{node in node.role==kAXStaticTextRole && [node.value,node.title,node.description].contains{labelMatches($0,name)}}}
+ guard matching.count==1 else{finish("held","duplicate_or_missing_chat_name")}
+ listRows=rows.count;resolvedChatName=name
+ finish("ready","room_name_unique")
 }
 if p["probe"] as? Bool == true && p["close_probe"] as? Bool == true {
  let target=windowList().filter{str($0,kAXTitleAttribute)==name}

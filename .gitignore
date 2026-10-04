@@ -11,3 +11,5 @@ build/
 .env*
 *.zip
 /runtime/
+desktop/target/
+desktop/gen/

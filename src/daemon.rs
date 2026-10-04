@@ -287,12 +287,42 @@ fn ingest(cfg: &Config, store: &Store, event: Event, notify: &Notify) -> Result<
         .into_iter()
         .filter(|a| *a == Agent::Yui || cfg.yumi.is_some())
         .collect();
+    if agents.is_empty() {
+        // A sister's name without her exact tag is a near-miss call. Recording it (with the body
+        // only under the operator's retention setting) shows why nobody answered.
+        if let Some(agent) = Agent::ALL
+            .into_iter()
+            .find(|a| event.body.contains(a.name()))
+        {
+            let reason = if agent == Agent::Yumi && cfg.yumi.is_none() {
+                "yumi_not_configured"
+            } else {
+                "name_without_exact_tag"
+            };
+            store.record_rejected(&event.for_agent(agent), reason)?;
+        }
+        return Err(Rejected.into());
+    }
+    // Only owner-approved rooms are answered; a new room waits on the dashboard for approval.
+    store.note_room_seen(&event.conversation, &event.title)?;
+    let room = store.room(&event.conversation)?.unwrap_or_default();
+    let approved = room["approved"] == true;
     let initialized = store.initialized(&event.conversation)?;
     let mut results = Vec::new();
     let mut queued = false;
     for agent in agents {
         let e = event.for_agent(agent);
-        let status = match e.validate(now(), initialized) {
+        let gate = if !approved && !store.answer_unapproved_rooms()? {
+            Some("room_pending_approval")
+        } else if approved && room[agent.name_key()] == false {
+            Some("sister_disabled_in_room")
+        } else {
+            None
+        };
+        let status = match gate.map_or_else(
+            || e.validate(now(), initialized),
+            |r| Err(anyhow::anyhow!(r)),
+        ) {
             Err(reason) => {
                 store.record_rejected(&e, &reason.to_string())?;
                 "rejected"

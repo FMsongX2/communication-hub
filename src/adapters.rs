@@ -46,6 +46,7 @@ impl Adapter for Kakao {
             return Ok(json!({"status":"held","reason":"missing_target"}));
         }
         let mut p = json!({"chat_name":name,"room_name_verified":route.is_some(),"trigger_body":e.body,"reply":plan.reply,"expires_at":crate::event::now()+75.0});
+        registry_hint(store, e, &mut p)?;
         // Staging is local only; the sender pastes the image after the text receipt in the same run,
         // so the second launch and second target scan of a separate attachment request disappear.
         let mut sticker = Value::Null;
@@ -100,9 +101,32 @@ impl Adapter for Kakao {
             }
             store.save_route(&e.conversation, name)?;
         }
+        note_list_size(store, e, &result)?;
         store.note_intro(&e.conversation, e.agent, &plan.reply, &result)?;
         Ok(result)
     }
+}
+/// An approved, verified room lets the sender skip the chat-list scan while the list size holds.
+fn registry_hint(store: &Store, e: &Event, request: &mut Value) -> Result<()> {
+    if let Some(room) = store.room(&e.conversation)?
+        && room["approved"] == true
+        && room["verified_rows"].is_i64()
+    {
+        request["room_verified_rows"] = room["verified_rows"].clone();
+    }
+    Ok(())
+}
+/// A full scan in an approved room refreshes the list size its name was proven unique at.
+fn note_list_size(store: &Store, e: &Event, receipt: &Value) -> Result<()> {
+    if let Some(rows) = receipt["list_rows"].as_i64()
+        && receipt["verified_chat_name"].is_string()
+        && store
+            .room(&e.conversation)?
+            .is_some_and(|r| r["approved"] == true)
+    {
+        store.note_room_verified(&e.conversation, rows)?;
+    }
+    Ok(())
 }
 impl Kakao {
     /// Runs the sender's full target verification without writing anything, so the scan of the
@@ -113,11 +137,43 @@ impl Kakao {
         if name.is_empty() {
             return Ok(json!({"status":"held","reason":"missing_target"}));
         }
-        self.native_request(
-            &json!({"chat_name":name,"room_name_verified":route.is_some(),"trigger_body":e.body,
-            "reply":e.agent.prefix(),"probe":true,"expires_at":crate::event::now()+75.0}),
-        )
-        .await
+        let mut p = json!({"chat_name":name,"room_name_verified":route.is_some(),"trigger_body":e.body,
+            "reply":e.agent.prefix(),"probe":true,"expires_at":crate::event::now()+75.0});
+        registry_hint(store, e, &mut p)?;
+        let receipt = self.native_request(&p).await?;
+        if receipt["status"] == "ready" {
+            note_list_size(store, e, &receipt)?;
+        }
+        Ok(receipt)
+    }
+    /// Dashboard registration: proves the room name is unique in the chat list without opening the
+    /// room or writing anything, and records the list size it held at.
+    pub async fn verify_room(&self, store: &Store, key: &str) -> Result<Value> {
+        let room = store
+            .rooms()?
+            .into_iter()
+            .find(|r| r["key"] == key)
+            .ok_or_else(|| anyhow::anyhow!("unknown_room"))?;
+        let title = room["title"].as_str().unwrap_or("");
+        if title.is_empty() {
+            return Ok(json!({"status":"held","reason":"missing_target"}));
+        }
+        let receipt = self
+            .native_request(&json!({"chat_name":title,"room_name_verified":true,"trigger_body":"room-verification",
+                "reply":crate::event::PREFIX,"verify_room":true,"expires_at":crate::event::now()+75.0}))
+            .await?;
+        if receipt["status"] == "ready"
+            && let Some(rows) = receipt["list_rows"].as_i64()
+        {
+            let parts: Vec<String> = serde_json::from_str(key)?;
+            let conversation = crate::event::Conversation {
+                provider: parts[0].clone(),
+                account: parts[1].clone(),
+                id: parts[2].clone(),
+            };
+            store.note_room_verified(&conversation, rows)?;
+        }
+        Ok(receipt)
     }
 }
 /// A sticker is decoration: once the text is verified the reply counts as delivered, and an

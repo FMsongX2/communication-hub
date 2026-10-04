@@ -11,7 +11,7 @@ use axum::{
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -104,6 +104,9 @@ pub fn router(board: Board) -> Router {
     let api = Router::new()
         .route("/api/snapshot", get(snapshot))
         .route("/api/calls", get(calls))
+        .route("/api/rooms", get(rooms).post(update_room))
+        .route("/api/rooms/verify", post(verify_room))
+        .route("/api/settings", post(update_settings))
         .route_layer(middleware::from_fn_with_state(board.clone(), auth));
     Router::new()
         .route(
@@ -181,6 +184,60 @@ async fn calls(
     b.store
         .calls(q.conversation.as_deref(), q.before, 50)
         .map(Json)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+async fn rooms(State(b): State<Board>) -> Result<Json<Value>, StatusCode> {
+    let fail = |_| StatusCode::SERVICE_UNAVAILABLE;
+    Ok(Json(json!({"rooms":b.store.rooms().map_err(fail)?,
+        "answer_unapproved_rooms":b.store.answer_unapproved_rooms().map_err(fail)?,
+        "yumi_configured":b.cfg.yumi.is_some()})))
+}
+#[derive(Deserialize)]
+pub struct RoomUpdate {
+    pub key: String,
+    pub approved: bool,
+    pub yui: bool,
+    pub yumi: bool,
+}
+async fn update_room(
+    State(b): State<Board>,
+    Json(u): Json<RoomUpdate>,
+) -> Result<Json<Value>, StatusCode> {
+    match b.store.update_room(&u.key, u.approved, u.yui, u.yumi) {
+        Ok(true) => Ok(Json(json!({"updated":true}))),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+#[derive(Deserialize)]
+pub struct RoomKey {
+    pub key: String,
+}
+/// Runs the sender's list-only uniqueness check for a room; nothing is opened or written.
+async fn verify_room(
+    State(b): State<Board>,
+    Json(r): Json<RoomKey>,
+) -> Result<Json<Value>, StatusCode> {
+    let adapter = crate::adapters::Kakao {
+        cfg: (*b.cfg).clone(),
+    };
+    adapter
+        .verify_room(&b.store, &r.key)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+#[derive(Deserialize)]
+pub struct Settings {
+    pub answer_unapproved_rooms: bool,
+}
+async fn update_settings(
+    State(b): State<Board>,
+    Json(s): Json<Settings>,
+) -> Result<Json<Value>, StatusCode> {
+    b.store
+        .set_answer_unapproved_rooms(s.answer_unapproved_rooms)
+        .map(|_| Json(json!({"updated":true})))
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
 pub async fn monitor(board: Board) {

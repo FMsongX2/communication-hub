@@ -51,6 +51,15 @@ fn config(root: &Path) -> Config {
         },
     }
 }
+/// The owner approves the fixture room on the dashboard before calls in it are answered.
+fn approve_room(cfg: &Config, e: &Event) {
+    let s = Store::open(cfg.state.clone()).unwrap();
+    s.note_room_seen(&e.conversation, &e.title).unwrap();
+    assert!(
+        s.update_room(&e.conversation.key(), true, true, true)
+            .unwrap()
+    );
+}
 fn event() -> Event {
     Event {
         conversation: Conversation {
@@ -527,6 +536,7 @@ async fn real_socket_control_and_intake_survive_burst_without_dispatch() {
         .unwrap();
     assert_eq!(status["result"]["runtime"], "rust");
     assert_eq!(status["result"]["dispatch_enabled"], false);
+    approve_room(&cfg, &event());
     for i in 0..20 {
         let mut e = event();
         e.id = format!("burst{i}");
@@ -604,6 +614,7 @@ async fn storage_failure_is_retryable_not_permanent_ingestion_rejection() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    approve_room(&cfg, &event());
     // Make a valid DB temporarily unable to accept writes.
     let db = rusqlite::Connection::open(cfg.state.join("hub.sqlite3")).unwrap();
     db.execute_batch("BEGIN EXCLUSIVE;").unwrap();
@@ -780,6 +791,84 @@ async fn dashboard_private_api_requires_auth_and_serves_no_token_in_html() {
         serde_json::from_slice(&r.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(v["bindings"][0]["thread_id"], "sample-thread");
     assert_eq!(v["bindings"][0]["call_available"], false);
+}
+#[tokio::test]
+async fn dashboard_room_changes_need_the_token_and_take_effect() {
+    use communication_hub::dashboard::{Board, router};
+    use http_body_util::BodyExt;
+    use std::sync::atomic::AtomicBool;
+    use tower::ServiceExt;
+    let t = TempDir::new().unwrap();
+    let cfg = config(t.path());
+    let store = Store::open(cfg.state.clone()).unwrap();
+    let e = event();
+    store.note_room_seen(&e.conversation, "fixture").unwrap();
+    let token = "c".repeat(64);
+    let app = router(Board {
+        cfg: Arc::new(cfg),
+        store: store.clone(),
+        active: Arc::new(AtomicBool::new(false)),
+        sending: Arc::new(AtomicBool::new(false)),
+        processing: Arc::new(AtomicBool::new(false)),
+        backend: Arc::new(tokio::sync::RwLock::new(json!({}))),
+        token: token.clone(),
+        origin: "http://127.0.0.1:43197".into(),
+    });
+    let post = |path: &str, body: Value, auth: bool| {
+        let mut r = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("host", "127.0.0.1:43197")
+            .header("content-type", "application/json");
+        if auth {
+            r = r.header("authorization", format!("Bearer {token}"));
+        }
+        r.body(axum::body::Body::from(body.to_string())).unwrap()
+    };
+    let change = json!({"key":e.conversation.key(),"approved":true,"yui":true,"yumi":false});
+    let r = app
+        .clone()
+        .oneshot(post("/api/rooms", change.clone(), false))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        store.room(&e.conversation).unwrap().unwrap()["approved"],
+        false
+    );
+    let r = app
+        .clone()
+        .oneshot(post("/api/rooms", change, true))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), axum::http::StatusCode::OK);
+    let room = store.room(&e.conversation).unwrap().unwrap();
+    assert_eq!(
+        (room["approved"].clone(), room["yumi"].clone()),
+        (json!(true), json!(false))
+    );
+    let r = app
+        .clone()
+        .oneshot(post(
+            "/api/settings",
+            json!({"answer_unapproved_rooms":true}),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), axum::http::StatusCode::OK);
+    assert!(store.answer_unapproved_rooms().unwrap());
+    let get = axum::http::Request::builder()
+        .uri("/api/rooms")
+        .header("host", "127.0.0.1:43197")
+        .header("authorization", format!("Bearer {token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let r = app.oneshot(get).await.unwrap();
+    let v: Value =
+        serde_json::from_slice(&r.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["rooms"][0]["title"], "fixture");
+    assert_eq!(v["answer_unapproved_rooms"], true);
 }
 
 #[tokio::test]
@@ -1263,6 +1352,7 @@ async fn one_message_calling_both_sisters_queues_one_event_each() {
     }
     let mut e = event();
     e.body = "@[유이] @[유미] 둘 다 안녕".into();
+    approve_room(&cfg, &e);
     let r = daemon::request(&cfg.socket, json!({"method":"ingest","event":e}))
         .await
         .unwrap();
@@ -1270,5 +1360,110 @@ async fn one_message_calling_both_sisters_queues_one_event_each() {
     assert_eq!(events.len(), 2);
     assert!(events.iter().all(|x| x["status"] == "queued"));
     assert_eq!(events[1]["agent"], "yumi");
+    // A name without the exact tag is not a call, but it is recorded as a near miss.
+    let mut near = event();
+    near.id = "near-miss".into();
+    near.body = "유미야 안녕".into();
+    let r = daemon::request(&cfg.socket, json!({"method":"ingest","event":near}))
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], false);
+    let calls = Store::open(cfg.state.clone())
+        .unwrap()
+        .calls(None, None, 10)
+        .unwrap();
+    assert!(
+        calls.to_string().contains("name_without_exact_tag"),
+        "{calls}"
+    );
     service.abort();
+}
+
+#[tokio::test]
+async fn unapproved_rooms_wait_for_the_owner_and_each_sister_can_be_switched_off() {
+    use communication_hub::daemon;
+    let t = TempDir::new().unwrap();
+    let mut cfg = config(t.path());
+    cfg.yumi = Some(communication_hub::config::YumiConfig {
+        claude_bin: t.path().join("missing-claude"),
+        persona: t.path().join("missing-persona.md"),
+        model: "claude-sonnet-5-5".into(),
+        effort: "low".into(),
+    });
+    let service = tokio::spawn(daemon::run(cfg.clone(), true));
+    for _ in 0..40 {
+        if cfg.socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let ingest = |id: &str, body: &str| {
+        let mut e = event();
+        e.id = id.into();
+        e.body = body.into();
+        daemon::request(&cfg.socket, json!({"method":"ingest","event":e}))
+    };
+    // A first call in an unknown room is held and the room is listed for approval.
+    assert_eq!(ingest("first", "@[유이] 안녕").await.unwrap()["ok"], false);
+    let s = Store::open(cfg.state.clone()).unwrap();
+    let rooms = s.rooms().unwrap();
+    assert_eq!(rooms.len(), 1);
+    assert_eq!(rooms[0]["approved"], false);
+    assert_eq!(rooms[0]["title"], "fixture");
+    assert!(
+        s.calls(None, None, 10)
+            .unwrap()
+            .to_string()
+            .contains("room_pending_approval")
+    );
+    // Approved with Yumi switched off: Yui answers, Yumi's half of the call is held.
+    let key = event().conversation.key();
+    assert!(s.update_room(&key, true, true, false).unwrap());
+    let r = ingest("second", "@[유이] @[유미] 둘 다").await.unwrap();
+    assert_eq!(r["result"]["events"][0]["status"], "queued");
+    assert_eq!(r["result"]["events"][1]["status"], "rejected");
+    assert!(
+        s.calls(None, None, 10)
+            .unwrap()
+            .to_string()
+            .contains("sister_disabled_in_room")
+    );
+    // The owner may also choose to answer rooms that were never approved.
+    let mut other = event();
+    other.conversation.id = "room-two".into();
+    other.id = "third".into();
+    s.set_answer_unapproved_rooms(true).unwrap();
+    let r = daemon::request(&cfg.socket, json!({"method":"ingest","event":other}))
+        .await
+        .unwrap();
+    assert_eq!(r["result"]["status"], "queued");
+    service.abort();
+}
+#[test]
+fn rooms_in_use_before_the_registry_start_approved_and_verification_is_recorded() {
+    let t = TempDir::new().unwrap();
+    let state = t.path().join("state");
+    let e = event();
+    {
+        let s = Store::open(state.clone()).unwrap();
+        s.save_route(&e.conversation, "예전 방").unwrap();
+        // Simulate a database from before the registry: no migration marker, no room rows.
+        let db = rusqlite::Connection::open(state.join("hub.sqlite3")).unwrap();
+        db.execute_batch("DELETE FROM rooms; DELETE FROM migrations WHERE name='rooms-v1';")
+            .unwrap();
+    }
+    let s = Store::open(state).unwrap();
+    let room = s.room(&e.conversation).unwrap().unwrap();
+    assert_eq!(room["approved"], true);
+    assert_eq!(room["title"], "예전 방");
+    s.note_room_verified(&e.conversation, 321).unwrap();
+    assert_eq!(
+        s.room(&e.conversation).unwrap().unwrap()["verified_rows"],
+        321
+    );
+    assert!(
+        s.update_room(&e.conversation.key(), false, true, true)
+            .unwrap()
+    );
+    assert_eq!(s.room(&e.conversation).unwrap().unwrap()["approved"], false);
 }

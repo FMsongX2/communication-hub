@@ -33,7 +33,22 @@ impl Store {
             CREATE TABLE IF NOT EXISTS expression_history(delivery TEXT PRIMARY KEY,conversation TEXT NOT NULL,sha256 TEXT NOT NULL,family TEXT NOT NULL,created REAL NOT NULL,verified INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS expression_room_time ON expression_history(conversation,created DESC);
             CREATE INDEX IF NOT EXISTS call_log_conversation ON call_log(conversation);
-            CREATE TABLE IF NOT EXISTS agent_intro(conversation TEXT NOT NULL,agent TEXT NOT NULL,PRIMARY KEY(conversation,agent));")?;
+            CREATE TABLE IF NOT EXISTS agent_intro(conversation TEXT NOT NULL,agent TEXT NOT NULL,PRIMARY KEY(conversation,agent));
+            CREATE TABLE IF NOT EXISTS rooms(conversation TEXT PRIMARY KEY,title TEXT NOT NULL,approved REAL,yui INTEGER NOT NULL DEFAULT 1,yumi INTEGER NOT NULL DEFAULT 1,verified_rows INTEGER,verified_at REAL,seen REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);")?;
+        // Rooms already answered in (a verified name) were in use before the registry existed.
+        db.execute(
+            "INSERT OR IGNORE INTO rooms(conversation,title,approved,seen) SELECT conversation,title,?1,?1 FROM routes WHERE title IS NOT NULL AND NOT EXISTS(SELECT 1 FROM migrations WHERE name='rooms-v1')",
+            [now()],
+        )?;
+        db.execute("INSERT OR IGNORE INTO migrations VALUES('rooms-v1')", [])?;
+        // Which sister a call addressed; older rows predate Yumi and were all Yui calls.
+        let has_agent = db
+            .prepare("SELECT 1 FROM pragma_table_info('call_log') WHERE name='agent'")?
+            .exists([])?;
+        if !has_agent {
+            db.execute("ALTER TABLE call_log ADD COLUMN agent TEXT", [])?;
+        }
         std::fs::set_permissions(&s.path, std::fs::Permissions::from_mode(0o600))?;
         Ok(s)
     }
@@ -81,6 +96,74 @@ impl Store {
     pub fn save_session(&self, c: &Conversation, thread: &str) -> Result<()> {
         self.db()?
             .execute("INSERT INTO sessions VALUES(?,?)", params![c.key(), thread])?;
+        Ok(())
+    }
+    /// The owner-approved room registry. A room appears here (unapproved) on its first call.
+    pub fn room(&self, c: &Conversation) -> Result<Option<Value>> {
+        Ok(self.db()?.query_row(
+            "SELECT title,approved,yui,yumi,verified_rows,verified_at FROM rooms WHERE conversation=?",
+            [c.key()],
+            |r| {
+                Ok(json!({"title":r.get::<_,String>(0)?,"approved":r.get::<_,Option<f64>>(1)?.is_some(),
+                    "yui":r.get::<_,i64>(2)?!=0,"yumi":r.get::<_,i64>(3)?!=0,
+                    "verified_rows":r.get::<_,Option<i64>>(4)?,"verified_at":r.get::<_,Option<f64>>(5)?}))
+            },
+        ).optional()?)
+    }
+    pub fn note_room_seen(&self, c: &Conversation, title: &str) -> Result<()> {
+        self.db()?.execute("INSERT INTO rooms(conversation,title,seen) VALUES(?,?,?) ON CONFLICT(conversation) DO UPDATE SET seen=excluded.seen",params![c.key(),title,now()])?;
+        Ok(())
+    }
+    /// Approval, per-sister switches and an optional title correction from the dashboard.
+    pub fn update_room(&self, key: &str, approved: bool, yui: bool, yumi: bool) -> Result<bool> {
+        Ok(self.db()?.execute(
+            "UPDATE rooms SET approved=CASE WHEN ?2 THEN COALESCE(approved,?5) ELSE NULL END,yui=?3,yumi=?4 WHERE conversation=?1",
+            params![key, approved, yui, yumi, now()],
+        )? == 1)
+    }
+    /// The chat-list size at which this room's name was last proven unique.
+    pub fn note_room_verified(&self, c: &Conversation, rows: i64) -> Result<()> {
+        self.db()?.execute(
+            "UPDATE rooms SET verified_rows=?,verified_at=? WHERE conversation=?",
+            params![rows, now(), c.key()],
+        )?;
+        Ok(())
+    }
+    pub fn rooms(&self) -> Result<Vec<Value>> {
+        let db = self.db()?;
+        let mut q = db.prepare("SELECT r.conversation,r.title,r.approved,r.yui,r.yumi,r.verified_rows,r.verified_at,r.seen,(SELECT max(c.occurred) FROM call_log c WHERE c.conversation=r.conversation),(SELECT count(*) FROM call_log c WHERE c.conversation=r.conversation) FROM rooms r ORDER BY r.approved IS NOT NULL, r.seen DESC")?;
+        let rows = q.query_map([], |r| {
+            let key: String = r.get(0)?;
+            Ok(json!({"key":key,"title":r.get::<_,String>(1)?,"approved":r.get::<_,Option<f64>>(2)?.is_some(),
+                "yui":r.get::<_,i64>(3)?!=0,"yumi":r.get::<_,i64>(4)?!=0,"verified_rows":r.get::<_,Option<i64>>(5)?,
+                "verified_at":r.get::<_,Option<f64>>(6)?,"seen":r.get::<_,f64>(7)?,
+                "last_call_at":r.get::<_,Option<f64>>(8)?,"recorded_calls":r.get::<_,i64>(9)?}))
+        })?;
+        let mut items = Vec::new();
+        for row in rows {
+            let mut row = row?;
+            let parts: Vec<String> = serde_json::from_str(row["key"].as_str().unwrap())?;
+            row["provider"] = json!(parts[0]);
+            row["account"] = json!(parts[1]);
+            row["conversation_id"] = json!(parts[2]);
+            items.push(row);
+        }
+        Ok(items)
+    }
+    /// Whether calls from rooms not yet approved are answered (`false` holds them for approval).
+    pub fn answer_unapproved_rooms(&self) -> Result<bool> {
+        Ok(self
+            .db()?
+            .query_row(
+                "SELECT value FROM settings WHERE key='answer_unapproved_rooms'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .is_some_and(|v| v == "true"))
+    }
+    pub fn set_answer_unapproved_rooms(&self, on: bool) -> Result<()> {
+        self.db()?.execute("INSERT INTO settings VALUES('answer_unapproved_rooms',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[on.to_string()])?;
         Ok(())
     }
     /// A room is initialized once it has a legacy session or a reply verified in it.
@@ -214,7 +297,7 @@ impl Store {
         )? == 1;
         if added {
             tx.execute(
-                "INSERT INTO call_log VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO call_log(event_key,conversation,message_id,occurred,trigger_kind,notification_title,body,agent) VALUES(?,?,?,?,?,?,?,?)",
                 params![
                     e.key(),
                     e.conversation.key(),
@@ -230,7 +313,8 @@ impl Store {
                         Some(e.body.as_str())
                     } else {
                         None
-                    }
+                    },
+                    e.agent.name_key()
                 ],
             )?;
         }
@@ -338,7 +422,7 @@ impl Store {
         limit: usize,
     ) -> Result<Value> {
         let db = self.db()?;
-        let mut stmt=db.prepare("SELECT e.key,e.status,e.reason,e.created,e.updated,c.conversation,c.message_id,c.occurred,c.trigger_kind,c.notification_title,c.body FROM events e LEFT JOIN call_log c ON c.event_key=e.key WHERE (?1 IS NULL OR c.conversation=?1 OR c.conversation IS NULL) AND (?2 IS NULL OR e.created<?2) ORDER BY e.created DESC LIMIT ?3")?;
+        let mut stmt=db.prepare("SELECT e.key,e.status,e.reason,e.created,e.updated,c.conversation,c.message_id,c.occurred,c.trigger_kind,c.notification_title,c.body,COALESCE(c.agent,'yui') FROM events e LEFT JOIN call_log c ON c.event_key=e.key WHERE (?1 IS NULL OR c.conversation=?1 OR c.conversation IS NULL) AND (?2 IS NULL OR e.created<?2) ORDER BY e.created DESC LIMIT ?3")?;
         let mut result = Vec::new();
         let mut cursor = Value::Null;
         let mut scanned = 0usize;
@@ -357,6 +441,7 @@ impl Store {
                     r.get::<_, Option<String>>(8)?,
                     r.get::<_, Option<String>>(9)?,
                     r.get::<_, Option<String>>(10)?,
+                    r.get::<_, String>(11)?,
                 ))
             },
         )? {
@@ -372,6 +457,7 @@ impl Store {
                 trigger,
                 notification_title,
                 body,
+                agent,
             ) = row?;
             scanned += 1;
             cursor = json!(created);
@@ -414,7 +500,7 @@ impl Store {
             if conversation.is_some_and(|wanted| scope.as_deref() != Some(wanted)) {
                 continue;
             }
-            result.push(json!({"event_key":key,"status":status,"reason":reason,"received_at":created,"updated_at":updated,"conversation_key":scope,"message_id":message_id,"occurred_at":occurred,"trigger_kind":trigger,"notification_title":notification_title,"sender_verified":false,"body":body,"historical_metadata_missing":trigger.is_none(),"deliveries":deliveries}));
+            result.push(json!({"event_key":key,"status":status,"reason":reason,"received_at":created,"updated_at":updated,"conversation_key":scope,"message_id":message_id,"occurred_at":occurred,"trigger_kind":trigger,"agent":agent,"notification_title":notification_title,"sender_verified":false,"body":body,"historical_metadata_missing":trigger.is_none(),"deliveries":deliveries}));
         }
         Ok(json!({"items":result,"next_before":cursor,"has_more":scanned>=limit.clamp(1,100)}))
     }
