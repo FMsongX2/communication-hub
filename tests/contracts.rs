@@ -789,8 +789,9 @@ async fn dashboard_private_api_requires_auth_and_serves_no_token_in_html() {
     assert_eq!(r.headers()["cache-control"], "no-store");
     let v: Value =
         serde_json::from_slice(&r.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(v["bindings"][0]["thread_id"], "sample-thread");
-    assert_eq!(v["bindings"][0]["call_available"], false);
+    // Calls are stateless: legacy thread bindings are no longer part of the board.
+    assert!(v["bindings"].is_null());
+    assert!(!v.to_string().contains("sample-thread"));
 }
 #[tokio::test]
 async fn dashboard_room_changes_need_the_token_and_take_effect() {
@@ -909,7 +910,7 @@ async fn actual_rpc_usage_limit_produces_exact_fallback() {
 }
 
 #[tokio::test]
-async fn dashboard_observation_never_starts_or_resumes_a_model_session() {
+async fn dashboard_backend_check_only_handshakes() {
     use communication_hub::dashboard::{Board, monitor};
     use std::sync::atomic::AtomicBool;
     let t = TempDir::new().unwrap();
@@ -963,11 +964,11 @@ async fn dashboard_observation_never_starts_or_resumes_a_model_session() {
     }
     assert_eq!(state.read().await["online"], true);
     let methods = calls.lock().unwrap();
-    assert!(methods.iter().any(|m| m == "thread/read"));
     assert!(
         methods
             .iter()
-            .all(|m| matches!(m.as_str(), "initialize" | "initialized" | "thread/read"))
+            .all(|m| matches!(m.as_str(), "initialize" | "initialized")),
+        "{methods:?}"
     );
     probe.abort();
     server.abort();
@@ -1497,4 +1498,41 @@ fn rooms_added_by_name_bind_on_first_call_and_removal_returns_them_to_pending() 
     assert_eq!(rooms[0]["conversation_id"], "room1");
     assert_eq!(rooms[0]["approved"], true);
     assert_eq!(rooms[0]["verified_rows"], 190);
+}
+#[test]
+fn context_reset_hides_earlier_exchanges_and_approval_initializes_the_room() {
+    let t = TempDir::new().unwrap();
+    let mut s = Store::open(t.path().join("state")).unwrap();
+    s.store_bodies = true;
+    let e = event();
+    assert!(!s.initialized(&e.conversation).unwrap());
+    s.note_room_seen(&e.conversation, "fixture").unwrap();
+    assert!(
+        s.update_room(&e.conversation.key(), true, true, true)
+            .unwrap()
+    );
+    assert!(s.initialized(&e.conversation).unwrap());
+    let answered = |id: &str, occurred: f64| {
+        let mut call = event();
+        call.id = id.into();
+        call.occurred_at = occurred;
+        call.body = format!("@[유이] {id}");
+        s.enqueue(&call).unwrap();
+        let plan = Plan {
+            reply: format!("[System-유이] : {id} 답"),
+            bundle_id: None,
+            sticker_id: None,
+        };
+        s.prepare(&call.key(), &call, "final", &plan).unwrap();
+        s.complete_delivery(&call.key(), &json!({"status":"sent_verified"}))
+            .unwrap();
+    };
+    answered("before", now() - 60.0);
+    assert_eq!(s.recent_exchanges(&e.conversation, 6).unwrap().len(), 1);
+    assert!(s.reset_room_context(&e.conversation.key()).unwrap());
+    assert!(s.recent_exchanges(&e.conversation, 6).unwrap().is_empty());
+    answered("after", now() + 1.0);
+    let recent = s.recent_exchanges(&e.conversation, 6).unwrap();
+    assert_eq!(recent.len(), 1);
+    assert!(recent[0].0.contains("after"));
 }

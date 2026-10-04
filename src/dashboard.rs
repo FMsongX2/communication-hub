@@ -109,6 +109,7 @@ pub fn router(board: Board) -> Router {
         .route("/api/rooms/available", get(available_rooms))
         .route("/api/rooms/add", post(add_room))
         .route("/api/rooms/remove", post(remove_room))
+        .route("/api/rooms/reset-context", post(reset_context))
         .route("/api/settings", post(update_settings))
         .route_layer(middleware::from_fn_with_state(board.clone(), auth));
     Router::new()
@@ -148,36 +149,8 @@ async fn snapshot(State(b): State<Board>) -> Result<Json<Value>, StatusCode> {
         .as_f64()
         .is_some_and(|t| at - t < 35.0);
     let backend_online = backend["online"] == true && backend_fresh;
-    let mut bindings = b
-        .store
-        .bindings()
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    for binding in &mut bindings {
-        let key = binding["key"].as_str().unwrap().to_owned();
-        binding["runtime"] = backend["sessions"][&key].clone();
-        let runtime_fresh = backend_online
-            && binding["runtime"]["observed_at"]
-                .as_f64()
-                .is_some_and(|t| at - t < 35.0);
-        binding["runtime_stale"] = json!(!runtime_fresh);
-        let configured = binding["provider"] == "kakao"
-            && binding["account"] == b.cfg.kakao.account
-            && b.cfg.kakao.enabled;
-        binding["configured"] = json!(configured);
-        binding["call_available"] = json!(
-            configured
-                && source["status"] == "online"
-                && backend_online
-                && runtime_fresh
-                && matches!(
-                    binding["runtime"]["state"].as_str(),
-                    Some("idle" | "active" | "notLoaded")
-                )
-                && b.active.load(Ordering::SeqCst)
-        );
-    }
     Ok(Json(
-        json!({"generated_at":at,"hub":{"pid":std::process::id(),"dispatch_enabled":b.active.load(Ordering::SeqCst),"external_auto_send":b.sending.load(Ordering::SeqCst),"processing":b.processing.load(Ordering::SeqCst),"model":b.cfg.model,"effort":b.cfg.effort,"service_tier":b.cfg.service_tier},"source":source,"backend":{"online":backend_online,"checked_at":backend["checked_at"],"stale":!backend_fresh},"bindings":bindings,"adapters":b.cfg.descriptors(),"counts":b.store.status().map_err(|_|StatusCode::SERVICE_UNAVAILABLE)?,"body_logging":b.store.store_bodies}),
+        json!({"generated_at":at,"hub":{"pid":std::process::id(),"dispatch_enabled":b.active.load(Ordering::SeqCst),"external_auto_send":b.sending.load(Ordering::SeqCst),"processing":b.processing.load(Ordering::SeqCst),"model":b.cfg.model,"effort":b.cfg.effort,"service_tier":b.cfg.service_tier},"source":source,"backend":{"online":backend_online,"checked_at":backend["checked_at"],"stale":!backend_fresh},"adapters":b.cfg.descriptors(),"counts":b.store.status().map_err(|_|StatusCode::SERVICE_UNAVAILABLE)?,"body_logging":b.store.store_bodies}),
     ))
 }
 async fn calls(
@@ -270,6 +243,17 @@ async fn add_room(
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     Ok(Json(json!({"added":true,"list_rows":rows})))
 }
+/// Earlier exchanges in the room stop being passed to Yui and Yumi.
+async fn reset_context(
+    State(b): State<Board>,
+    Json(r): Json<RoomKey>,
+) -> Result<Json<Value>, StatusCode> {
+    match b.store.reset_room_context(&r.key) {
+        Ok(true) => Ok(Json(json!({"reset":true}))),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
 async fn remove_room(
     State(b): State<Board>,
     Json(r): Json<RoomKey>,
@@ -293,43 +277,19 @@ async fn update_settings(
         .map(|_| Json(json!({"updated":true})))
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
+/// Backend health only: a connection handshake every 15 s. Calls are stateless, so no thread is
+/// read, resumed or created here.
 pub async fn monitor(board: Board) {
-    let mut offset = 0usize;
     loop {
-        let mut result = json!({"online":false,"checked_at":now(),"sessions":{}});
-        let bindings = board.store.bindings().unwrap_or_default();
-        // Read-only observation: never resume, subscribe, create or run a turn.
-        if let Ok(Ok(mut rpc)) = tokio::time::timeout(
-            Duration::from_secs(4),
-            Rpc::connect(&board.cfg.app_server_socket),
-        )
-        .await
-        {
-            result["online"] = json!(true);
-            let length = bindings.len();
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            for b in bindings.iter().cycle().skip(offset).take(length.min(256)) {
-                if tokio::time::Instant::now() > deadline {
-                    break;
-                }
-                offset = if length > 0 { (offset + 1) % length } else { 0 };
-                let key = b["key"].as_str().unwrap();
-                let read = tokio::time::timeout(
-                    Duration::from_secs(3),
-                    rpc.call(
-                        "thread/read",
-                        json!({"threadId":b["thread_id"],"includeTurns":false}),
-                    ),
-                )
-                .await;
-                result["sessions"][key] = match read {
-                    Ok(Ok(v)) => json!({"state":v["thread"]["status"]["type"],"observed_at":now()}),
-                    _ => json!({"state":"unknown","observed_at":now()}),
-                };
-            }
-        }
-        result["checked_at"] = json!(now());
-        *board.backend.write().await = result;
+        let online = matches!(
+            tokio::time::timeout(
+                Duration::from_secs(4),
+                Rpc::connect(&board.cfg.app_server_socket)
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        *board.backend.write().await = json!({"online":online,"checked_at":now()});
         tokio::time::sleep(Duration::from_secs(15)).await;
     }
 }

@@ -49,6 +49,13 @@ impl Store {
         if !has_agent {
             db.execute("ALTER TABLE call_log ADD COLUMN agent TEXT", [])?;
         }
+        // Calls before this moment no longer travel as a room's recent context.
+        let has_reset = db
+            .prepare("SELECT 1 FROM pragma_table_info('rooms') WHERE name='context_reset_at'")?
+            .exists([])?;
+        if !has_reset {
+            db.execute("ALTER TABLE rooms ADD COLUMN context_reset_at REAL", [])?;
+        }
         std::fs::set_permissions(&s.path, std::fs::Permissions::from_mode(0o600))?;
         Ok(s)
     }
@@ -159,6 +166,13 @@ impl Store {
         }
         Ok(())
     }
+    /// Starts a room's conversation afresh: earlier exchanges are no longer passed to the sisters.
+    pub fn reset_room_context(&self, key: &str) -> Result<bool> {
+        Ok(self.db()?.execute(
+            "UPDATE rooms SET context_reset_at=? WHERE conversation=?",
+            params![now(), key],
+        )? == 1)
+    }
     pub fn remove_room(&self, key: &str) -> Result<bool> {
         Ok(self
             .db()?
@@ -182,13 +196,14 @@ impl Store {
     }
     pub fn rooms(&self) -> Result<Vec<Value>> {
         let db = self.db()?;
-        let mut q = db.prepare("SELECT r.conversation,r.title,r.approved,r.yui,r.yumi,r.verified_rows,r.verified_at,r.seen,(SELECT max(c.occurred) FROM call_log c WHERE c.conversation=r.conversation),(SELECT count(*) FROM call_log c WHERE c.conversation=r.conversation) FROM rooms r ORDER BY r.approved IS NOT NULL, r.seen DESC")?;
+        let mut q = db.prepare("SELECT r.conversation,r.title,r.approved,r.yui,r.yumi,r.verified_rows,r.verified_at,r.seen,(SELECT max(c.occurred) FROM call_log c WHERE c.conversation=r.conversation),(SELECT count(*) FROM call_log c WHERE c.conversation=r.conversation),r.context_reset_at FROM rooms r ORDER BY r.approved IS NOT NULL, r.seen DESC")?;
         let rows = q.query_map([], |r| {
             let key: String = r.get(0)?;
             Ok(json!({"key":key,"title":r.get::<_,String>(1)?,"approved":r.get::<_,Option<f64>>(2)?.is_some(),
                 "yui":r.get::<_,i64>(3)?!=0,"yumi":r.get::<_,i64>(4)?!=0,"verified_rows":r.get::<_,Option<i64>>(5)?,
                 "verified_at":r.get::<_,Option<f64>>(6)?,"seen":r.get::<_,f64>(7)?,
-                "last_call_at":r.get::<_,Option<f64>>(8)?,"recorded_calls":r.get::<_,i64>(9)?}))
+                "last_call_at":r.get::<_,Option<f64>>(8)?,"recorded_calls":r.get::<_,i64>(9)?,
+                "context_reset_at":r.get::<_,Option<f64>>(10)?}))
         })?;
         let mut items = Vec::new();
         for row in rows {
@@ -217,10 +232,11 @@ impl Store {
         self.db()?.execute("INSERT INTO settings VALUES('answer_unapproved_rooms',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[on.to_string()])?;
         Ok(())
     }
-    /// A room is initialized once it has a legacy session or a reply verified in it.
+    /// A room is initialized once the owner approved it, it has a legacy session, or a reply was
+    /// verified in it.
     pub fn initialized(&self, c: &Conversation) -> Result<bool> {
         Ok(self.db()?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE conversation=?1) OR EXISTS(SELECT 1 FROM routes WHERE conversation=?1 AND title IS NOT NULL)",
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE conversation=?1) OR EXISTS(SELECT 1 FROM routes WHERE conversation=?1 AND title IS NOT NULL) OR EXISTS(SELECT 1 FROM rooms WHERE conversation=?1 AND approved IS NOT NULL)",
             [c.key()],
             |r| r.get(0),
         )?)
@@ -233,7 +249,7 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<(String, String)>> {
         let db = self.db()?;
-        let mut q = db.prepare("SELECT c.body,d.plan FROM call_log c JOIN deliveries d ON d.event_key=c.event_key AND d.phase='final' AND d.status='sent_verified' WHERE c.conversation=? AND c.body IS NOT NULL ORDER BY c.occurred DESC LIMIT ?")?;
+        let mut q = db.prepare("SELECT c.body,d.plan FROM call_log c JOIN deliveries d ON d.event_key=c.event_key AND d.phase='final' AND d.status='sent_verified' WHERE c.conversation=?1 AND c.body IS NOT NULL AND c.occurred>COALESCE((SELECT context_reset_at FROM rooms WHERE conversation=?1),0) ORDER BY c.occurred DESC LIMIT ?2")?;
         let mut rows = q
             .query_map(params![c.key(), limit as i64], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
@@ -444,27 +460,6 @@ impl Store {
         Ok(
             json!({"events":events,"deliveries":deliveries,"sessions":db.query_row("SELECT count(*) FROM sessions",[],|r|r.get::<_,i64>(0))?}),
         )
-    }
-    pub fn bindings(&self) -> Result<Vec<Value>> {
-        let db = self.db()?;
-        let mut stmt=db.prepare("SELECT s.conversation,s.thread,r.title,r.introduced,(SELECT max(e.created) FROM call_log c JOIN events e ON c.event_key=e.key WHERE c.conversation=s.conversation),(SELECT count(*) FROM call_log c JOIN events e ON c.event_key=e.key WHERE c.conversation=s.conversation),(SELECT count(*) FROM call_log c JOIN events e ON c.event_key=e.key WHERE c.conversation=s.conversation AND e.status='dispatching') FROM sessions s LEFT JOIN routes r ON s.conversation=r.conversation ORDER BY s.conversation")?;
-        let mut items = Vec::new();
-        for row in stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                r.get::<_, Option<f64>>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, i64>(6)?,
-            ))
-        })? {
-            let (key, thread, title, introduced, last, count, busy) = row?;
-            let parts: Vec<String> = serde_json::from_str(&key)?;
-            items.push(json!({"key":key,"provider":parts[0],"account":parts[1],"conversation_id":parts[2],"thread_id":thread,"title":title,"introduced":introduced.unwrap_or(0)!=0,"last_call_at":last,"recorded_calls":count,"processing":busy>0}));
-        }
-        Ok(items)
     }
     pub fn calls(
         &self,
