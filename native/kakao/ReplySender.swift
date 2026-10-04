@@ -86,6 +86,9 @@ if let key=requestKey {
  raw=data
 } else {raw=FileHandle.standardInput.readDataToEndOfFile()}
 guard let p=(try? JSONSerialization.jsonObject(with:raw)) as? [String:Any],let name=p["chat_name"] as? String,let trigger=p["trigger_body"] as? String,let reply=p["reply"] as? String,!name.isEmpty,!trigger.isEmpty,reply.hasPrefix("[System-유이] : "),reply.count<8192 else{finish("held","invalid_input")}
+let phase=p["phase"] as? String ?? "combined"
+guard phase=="combined" || phase=="attachment_only" else{finish("held","invalid_delivery_phase")}
+if phase=="attachment_only" && p["prior_text_verified"] as? Bool != true {finish("held","prior_text_verification_missing")}
 stamp("input_read")
 func requireUnexpired(){
  if let deadline=p["expires_at"] as? Double,Date().timeIntervalSince1970>deadline{finish(textSent ? "partial_file_held":(inputStarted ? "sending":"held"),"request_expired")}
@@ -95,6 +98,12 @@ if let session=CGSessionCopyCurrentDictionary() as? [String:Any],session["CGSSes
 let apps=NSRunningApplication.runningApplications(withBundleIdentifier:"com.kakao.KakaoTalkMac")
 guard apps.count==1 else{finish("held","kakao_not_running_or_ambiguous")}
 let app=apps[0],root=AXUIElementCreateApplication(app.processIdentifier)
+func postKeyboardKey(_ keyCode:CGKeyCode,_ flags:CGEventFlags=[]) -> Bool {
+ guard let down=CGEvent(keyboardEventSource:nil,virtualKey:keyCode,keyDown:true),let up=CGEvent(keyboardEventSource:nil,virtualKey:keyCode,keyDown:false) else{return false}
+ down.flags=flags;up.flags=flags
+ down.postToPid(app.processIdentifier);Thread.sleep(forTimeInterval:0.03);up.postToPid(app.processIdentifier)
+ return true
+}
 func windowList()->[AXUIElement] {attr(root,kAXWindowsAttribute) as? [AXUIElement] ?? []}
 if p["probe"] as? Bool == true && p["inspect_windows"] as? Bool == true {
  openTarget=["window_titles":windowList().map{str($0,kAXTitleAttribute)}]
@@ -243,6 +252,17 @@ let editors=nodes.filter{$0.isComposer}
 guard editors.count==1 else{finish("held","composer_ambiguous")}
 let editor=editors[0].element
 let originalDraft=str(editor,kAXValueAttribute)
+func sameVerifiedRoom(_ expectedDraft:String)->Bool {
+ let named=windowList().filter{str($0,kAXTitleAttribute)==actualName}
+ guard named.count==1,CFEqual(named[0],win),str(win,kAXTitleAttribute)==actualName else{return false}
+ let fresh=collect(win)
+ guard fresh.contains(where:{$0.value==trigger}) else{return false}
+ let composers=fresh.filter{$0.isComposer}
+ guard composers.count==1,CFEqual(composers[0].element,editor),composers[0].value==expectedDraft else{return false}
+ // Keys are PID-scoped and each key operation verifies the exact AX focused element.
+ // The globally foreground app may be unrelated; it is not a routing authority.
+ return true
+}
 let before=nodes.filter{$0.value==reply && !$0.isComposer}.count
 var backupURL:URL?=nil
 if !originalDraft.isEmpty {
@@ -267,16 +287,54 @@ func performAttachment(_ path:String){
  requireUnexpired()
  let file=URL(fileURLWithPath:path).standardizedFileURL.resolvingSymlinksInPath()
  let allowed=senderState.appendingPathComponent("file-jobs").standardizedFileURL.path+"/"
- guard file.path.hasPrefix(allowed),file.pathExtension.lowercased()=="zip",FileManager.default.fileExists(atPath:file.path) else{finish("partial_file_held","invalid_attachment_path")}
+ let suffix=file.pathExtension.lowercased()
+ guard file.path.hasPrefix(allowed),FileManager.default.fileExists(atPath:file.path),
+       let header=try? Data(contentsOf:file,options:.mappedIfSafe),!header.isEmpty else{finish("partial_file_held","invalid_attachment_path")}
+ let kind:String
+ if suffix=="zip",header.starts(with:[0x50,0x4b,0x03,0x04]) {kind="zip"}
+ else if suffix=="png",header.starts(with:[0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]) {kind="image"}
+ else if suffix=="gif" && (header.prefix(6)==Data("GIF87a".utf8) || header.prefix(6)==Data("GIF89a".utf8)) {kind="image"}
+ else {finish("partial_file_held","attachment_type_or_signature_unsupported")}
  if let session=CGSessionCopyCurrentDictionary() as? [String:Any],session["CGSSessionScreenIsLocked"] as? Bool == true {finish("partial_file_held","screen_locked")}
- guard str(win,kAXTitleAttribute)==actualName,str(editor,kAXValueAttribute)==originalDraft else{finish("partial_file_held","composer_changed_before_attachment")}
- func completeFiles()->Int {
+ guard sameVerifiedRoom(originalDraft) else{finish("partial_file_held","target_changed_before_attachment")}
+ func filenameMarkerCount()->Int {
   collect(win).filter{node in
    let text=node.value+node.title+node.description
-   return node.role==kAXStaticTextRole && text.contains(file.lastPathComponent) && text.contains("유효기간")
+   guard text.contains(file.lastPathComponent) else{return false}
+   if kind=="zip" {return node.role==kAXStaticTextRole && text.contains("유효기간")}
+   return node.role==kAXStaticTextRole || node.role==kAXImageRole
   }.count
  }
- let beforeFiles=completeFiles()
+ func outgoingImageBubbleCount()->Int {
+  let posValue=attr(win,kAXPositionAttribute),sizeValue=attr(win,kAXSizeAttribute)
+  guard let posValue,let sizeValue,CFGetTypeID(posValue)==AXValueGetTypeID(),CFGetTypeID(sizeValue)==AXValueGetTypeID() else{return 0}
+  var origin=CGPoint.zero,size=CGSize.zero
+  guard AXValueGetValue(posValue as! AXValue,.cgPoint,&origin),AXValueGetValue(sizeValue as! AXValue,.cgSize,&size),size.width>0 else{return 0}
+  let tables=collect(win).filter{$0.role==kAXTableRole}
+  guard tables.count==1,let rows=attr(tables[0].element,"AXRows") as? [AXUIElement] else{return 0}
+  return rows.filter{row in
+   let nodes=collect(row)
+   guard nodes.contains(where:{$0.role==kAXButtonRole && ($0.title=="공유" || $0.description=="공유")}),
+         !nodes.contains(where:{$0.role==kAXTextAreaRole || ($0.value+$0.title+$0.description).contains("유효기간")}) else{return false}
+   return nodes.contains{node in
+    guard node.role==kAXImageRole,let pv=attr(node.element,kAXPositionAttribute),let sv=attr(node.element,kAXSizeAttribute),CFGetTypeID(pv)==AXValueGetTypeID(),CFGetTypeID(sv)==AXValueGetTypeID() else{return false}
+    var p=CGPoint.zero,s=CGSize.zero
+    guard AXValueGetValue(pv as! AXValue,.cgPoint,&p),AXValueGetValue(sv as! AXValue,.cgSize,&s),s.width>16,s.height>16 else{return false}
+    // Actual Kakao image bubbles expose no filename. Require the outgoing/right alignment,
+    // a share control and no text/file payload, after the verified filename preview.
+    return p.x>origin.x+size.width*0.2 && p.x+s.width>origin.x+size.width*0.8 && p.x+s.width<=origin.x+size.width+2
+   }
+  }.count
+ }
+ func uploadPreviewVisible()->Bool {
+  let sheets=attr(win,"AXSheets") as? [AXUIElement] ?? []
+  let tree=(sheets.isEmpty ? [win] : sheets).flatMap{collect($0)}
+  let hasName=tree.contains{($0.value+$0.title+$0.description).contains(file.lastPathComponent)}
+  let hasSend=tree.contains{$0.role==kAXButtonRole && ($0.title=="1개 전송" || $0.description=="1개 전송")}
+  return hasName && hasSend
+ }
+ let beforeMarkers=filenameMarkerCount()
+ let beforeImages=kind=="image" ? outgoingImageBubbleCount():0
  let clipboard=NSPasteboard.general
  let saved=clipboard.pasteboardItems?.map{item in
   item.types.reduce(into:[NSPasteboard.PasteboardType:Data]()){result,type in
@@ -299,56 +357,57 @@ func performAttachment(_ path:String){
  _=AXUIElementPerformAction(win,kAXRaiseAction as CFString)
  _=app.activate(options:[])
  _=AXUIElementSetAttributeValue(editor,kAXFocusedAttribute as CFString,kCFBooleanTrue)
- guard let focused=attr(root,kAXFocusedUIElementAttribute),CFEqual(focused,editor),str(win,kAXTitleAttribute)==actualName else{finish("partial_file_held","attachment_focus_not_verified")}
- guard let down=CGEvent(keyboardEventSource:nil,virtualKey:9,keyDown:true),let up=CGEvent(keyboardEventSource:nil,virtualKey:9,keyDown:false) else{finish("partial_file_held","attachment_key_creation_failed")}
- down.flags = .maskCommand;up.flags = .maskCommand
- down.postToPid(app.processIdentifier);up.postToPid(app.processIdentifier)
+ guard let focused=attr(root,kAXFocusedUIElementAttribute),CFEqual(focused,editor),sameVerifiedRoom(originalDraft) else{finish("partial_file_held","attachment_focus_not_verified")}
+ guard postKeyboardKey(9,.maskCommand) else{finish("partial_file_held","attachment_paste_key_creation_failed")}
  let previewDeadline=Date().addingTimeInterval(8)
  var uploadButton:AXUIElement?=nil
  while Date()<previewDeadline {
   Thread.sleep(forTimeInterval:0.1)
   let sheets=attr(win,"AXSheets") as? [AXUIElement] ?? []
-  let sheetNodes:[Node]=sheets.flatMap{collect($0)}
-  let nodes:[Node]=sheetNodes.isEmpty ? collect(win) : sheetNodes
-  if nodes.contains(where:{($0.value+$0.title+$0.description).contains(file.lastPathComponent)}) {
-   let sends=nodes.filter{node in
-    let uploadTitle=(node.title=="1개 전송" || node.description=="1개 전송")
-    return node.role==kAXButtonRole && uploadTitle && node.enabled
-   }
+  let previewNodes:[Node]=sheets.isEmpty ? collect(win) : sheets.flatMap{collect($0)}
+  if previewNodes.contains(where:{($0.value+$0.title+$0.description).contains(file.lastPathComponent)}) {
+   let sends=previewNodes.filter{$0.role==kAXButtonRole && ($0.title=="1개 전송" || $0.description=="1개 전송") && $0.enabled}
    if sends.count==1 {uploadButton=sends[0].element;break}
   }
  }
- guard let upload=uploadButton,str(win,kAXTitleAttribute)==actualName else{finish("partial_file_held","attachment_preview_not_verified")}
+ guard let upload=uploadButton,str(win,kAXTitleAttribute)==actualName,sameVerifiedRoom(originalDraft) else{finish("partial_file_held","attachment_preview_not_verified")}
+ guard AXUIElementSetAttributeValue(upload,kAXFocusedAttribute as CFString,kCFBooleanTrue) == .success,
+       let sendFocused=attr(root,kAXFocusedUIElementAttribute),CFEqual(sendFocused,upload),
+       str(win,kAXTitleAttribute)==actualName,sameVerifiedRoom(originalDraft) else{finish("partial_file_held","attachment_enter_focus_not_verified")}
  stamp("before_attachment_send")
  requireUnexpired()
- _=AXUIElementPerformAction(upload,kAXPressAction as CFString)
+ guard postKeyboardKey(36) else{finish("sending","attachment_enter_outcome_uncertain")}
  let deadline=Date().addingTimeInterval(35)
  while Date()<deadline {
   Thread.sleep(forTimeInterval:0.15)
-  if str(win,kAXTitleAttribute)==actualName && completeFiles()>beforeFiles {
+  if str(win,kAXTitleAttribute)==actualName && sameVerifiedRoom(originalDraft) && !uploadPreviewVisible() && (filenameMarkerCount()>beforeMarkers || kind=="image" && outgoingImageBubbleCount()>beforeImages) {
    attachmentSent=true;stamp("attachment_verified");return
   }
  }
  finish("sending","attachment_delivery_not_observed")
 }
-guard str(win,kAXTitleAttribute)==actualName,str(editor,kAXValueAttribute)==originalDraft else{finish("held","composer_changed_before_write")}
+if phase=="attachment_only" {
+ guard p["prior_text_verified"] as? Bool == true,str(editor,kAXValueAttribute).isEmpty,
+       collect(win).contains(where:{$0.value==reply && !$0.isComposer}),sameVerifiedRoom("") else{finish("partial_file_held","prior_text_not_confirmed_in_target_room")}
+ textSent=true;stamp("prior_text_verified_for_attachment")
+ guard let path=p["attachment_path"] as? String else{finish("partial_file_held","missing_sticker_attachment_path")}
+ performAttachment(path)
+ finish("sent_verified","")
+}
+_=AXUIElementPerformAction(win,kAXRaiseAction as CFString)
+_=app.activate(options:[])
+guard sameVerifiedRoom(originalDraft) else{finish("held","target_or_draft_changed_before_write")}
 requireUnexpired()
 stamp("before_input")
 inputStarted=true
 guard AXUIElementSetAttributeValue(editor,kAXValueAttribute as CFString,reply as CFString) == .success else{finish("sending","composer_write_outcome_uncertain")}
 guard str(win,kAXTitleAttribute)==actualName,str(editor,kAXValueAttribute)==reply else{finish("sending","composer_changed_after_write")}
-let sendButtons=nodes.filter{$0.isSend}
-guard sendButtons.count==1 else{finish("sending","send_button_ambiguous_after_input")}
-let button=sendButtons[0].element
-var ready=false
-for _ in 0..<10 {
- if attr(button,kAXEnabledAttribute) as? Bool == true {ready=true;break}
- Thread.sleep(forTimeInterval:0.05)
-}
-guard ready,str(editor,kAXValueAttribute)==reply else{finish("sending","composer_or_send_button_changed")}
+guard AXUIElementSetAttributeValue(editor,kAXFocusedAttribute as CFString,kCFBooleanTrue) == .success,
+      let textFocused=attr(root,kAXFocusedUIElementAttribute),CFEqual(textFocused,editor),
+      str(editor,kAXValueAttribute)==reply,sameVerifiedRoom(reply) else{finish("sending","composer_focus_or_target_changed")}
 stamp("before_send")
 requireUnexpired()
-let pressed=AXUIElementPerformAction(button,kAXPressAction as CFString)
+guard postKeyboardKey(36) else{finish("sending","text_enter_event_creation_failed")}
 for _ in 0..<20 {
  Thread.sleep(forTimeInterval:0.1)
  if str(win,kAXTitleAttribute)==actualName && str(editor,kAXValueAttribute).isEmpty {
@@ -359,4 +418,4 @@ for _ in 0..<20 {
   }
  }
 }
-finish("sending",pressed == .success ? "delivery_not_observed":"press_outcome_uncertain")
+finish("sending","text_enter_delivery_not_observed")

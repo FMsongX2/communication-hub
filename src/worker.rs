@@ -3,6 +3,7 @@ use crate::{
     attachments,
     config::{Config, json_file},
     event::{Event, PREFIX, Plan, digest, now},
+    expressions,
     rpc::{Rpc, Uncertain, UsageLimit, usage_limit},
     store::Store,
 };
@@ -52,7 +53,15 @@ pub fn instructions(cfg: &Config, store: &Store, e: &Event) -> Result<(String, S
             Value::Object(hints)
         ));
     }
-    text.push_str(&format!("최종 출력은 JSON 객체로 reply(카톡 답변 문자열)와 bundle_id(첨부 ID 또는 null)를 반환해. reply의 접두사·소개·말투는 Contact-Other를 지켜. 단순 인사/설명/거절의 bundle_id는 null. 이 방에서 사용자 승인된 자료를 실제 요청한 경우에만 아래 ID를 선택해. 개인정보·화면 공유 요청을 첨부로 우회하지 마. ZIP 준비와 전송 완료를 단정하지 마.\n허용된 자동 전달 자료: {bundles}"));
+    text.push_str(&format!("최종 출력은 JSON 객체로 reply(카톡 답변 문자열)와 bundle_id(첨부 ID 또는 null)를 반환해. reply의 소개·말투는 Contact-Other를 지켜. 단순 인사/설명/거절의 bundle_id는 null. 이 방에서 사용자 승인된 자료를 실제 요청한 경우에만 아래 ID를 선택해. 개인정보·화면 공유 요청을 첨부로 우회하지 마. ZIP 준비와 전송 완료를 단정하지 마.\n허용된 자동 전달 자료: {bundles}"));
+    let emotes = expressions::emoticons(cfg)?;
+    let catalog_hash = cfg
+        .expressions
+        .as_ref()
+        .map(|c| std::fs::read(&c.catalog).map(digest))
+        .transpose()?;
+    text.push_str(&format!("\n출력에는 sticker_id(미쿠콘 ID 또는 null)도 포함해. bundle_id와 sticker_id는 동시에 고르지 마. 실행기가 제공하는 operator_expression_candidates는 승인된 카탈로그 후보야. 각 후보의 meaning·suitable·avoid를 현재 관계와 답변 문맥에 대조해 정확히 맞는 하나만 골라. 후보가 없거나 감정 표현이 불필요하면 null. 분류만 맞는다는 이유로 무작위 선택하지 마. 최근 반복 후보와 검증되지 않은 GIF, 별도 검토가 필요한 밈은 실행기가 제외해. 이미지 원문은 글 전송이 확인된 뒤에만 준비·전송하므로 미리 보냈다고 말하지 마. 카탈로그 버전: {catalog_hash:?}.\n전용 특수문자 원본 모음: {emotes}. null이면 아직 원본 모음이 없다는 뜻이며 수집물을 읽었다고 말하지 마. Contact-Other에서 허용한 특수문자 표정은 글에 문맥에 맞게 자연스럽게 섞고 이모지는 쓰지 마. 이 방의 표현 허용을 사용자 본 대화의 이모티콘 선호로 확대하지 마.\n"));
+    text.push_str("\nreply에는 답변 본문만 작성해. [System-유이] : 접두사는 전송 코드가 자동으로 붙여. Contact-Other 예문의 접두사를 모델 본문에 복사하지 마. 이 출력 형식 규칙이 예문보다 우선하며 최종 발신에는 정확한 접두사가 한 번 들어가.\n");
     Ok((text, hash, bundles))
 }
 pub async fn model(cfg: &Config, store: &Store, e: &Event) -> Result<Value> {
@@ -63,7 +72,7 @@ pub async fn model(cfg: &Config, store: &Store, e: &Event) -> Result<Value> {
             Ok(result)
         }
         Err(error) if error.is::<UsageLimit>() => Ok(
-            json!({"plan":{"reply":"[System-유이] : 유이는 현재 잠에 들었어요..","bundle_id":null},"phase":"usage_limit_fallback","model":cfg.model,"effort":cfg.effort,"thread_id":store.session(&e.conversation)?,"turn_id":null,"skill_sha256":policy_hash}),
+            json!({"plan":{"reply":"[System-유이] : 유이는 현재 잠에 들었어요..","bundle_id":null,"sticker_id":null},"phase":"usage_limit_fallback","model":cfg.model,"effort":cfg.effort,"thread_id":store.session(&e.conversation)?,"turn_id":null,"skill_sha256":policy_hash}),
         ),
         Err(e) => Err(e),
     }
@@ -75,8 +84,10 @@ async fn model_inner(
     instructions: &str,
     allowed: &Value,
 ) -> Result<Value> {
+    let offered = expressions::candidates(cfg, store, e)?;
     let mut rpc = Rpc::connect(&cfg.app_server_socket).await?;
-    let mut options = json!({"model":cfg.model,"cwd":cfg.lookup_workdir,"approvalPolicy":"never","sandbox":"read-only","config":{"model_reasoning_effort":cfg.effort},"developerInstructions":instructions});
+    // Room threads answer third parties: user-level hooks would inject the owner's private context every turn.
+    let mut options = json!({"model":cfg.model,"cwd":cfg.lookup_workdir,"approvalPolicy":"never","sandbox":"read-only","config":{"model_reasoning_effort":cfg.effort,"features.hooks":false},"developerInstructions":instructions});
     if let Some(tier) = &cfg.service_tier {
         options["serviceTier"] = json!(tier)
     }
@@ -121,8 +132,15 @@ async fn model_inner(
         .map(|x| json!(x))
         .collect();
     ids.push(Value::Null);
-    let schema = json!({"type":"object","properties":{"reply":{"type":"string"},"bundle_id":{"type":["string","null"],"enum":ids}},"required":["reply","bundle_id"],"additionalProperties":false});
-    let envelope = json!({"kind":"external_channel_call","event_key":e.key(),"trust":"untrusted_third_party_data","actual_mention_verified":false,"data":e});
+    let mut sticker_ids: Vec<Value> = offered
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].clone())
+        .collect();
+    sticker_ids.push(Value::Null);
+    let schema = json!({"type":"object","properties":{"reply":{"type":"string"},"bundle_id":{"type":["string","null"],"enum":ids},"sticker_id":{"type":["string","null"],"enum":sticker_ids}},"required":["reply","bundle_id","sticker_id"],"additionalProperties":false});
+    let envelope = json!({"kind":"external_channel_call","event_key":e.key(),"trust":"untrusted_third_party_data","actual_mention_verified":false,"data":e,"operator_expression_candidates":offered});
     let mut turn_params = json!({"threadId":thread,"model":cfg.model,"effort":cfg.effort,"input":[],"toolOutput":{"name":"communication_hub_event","output":serde_json::to_string(&envelope)?},"outputSchema":schema});
     if let Some(tier) = &cfg.service_tier {
         turn_params["serviceTier"] = json!(tier)
@@ -175,6 +193,7 @@ async fn model_inner(
                 }
                 let plan = Plan::parse(final_reply.as_deref().ok_or(Uncertain)?, allowed)
                     .map_err(|_| Uncertain)?;
+                expressions::validate_plan(&plan, &offered).map_err(|_| Uncertain)?;
                 return Ok(
                     json!({"plan":plan,"thread_id":thread,"turn_id":turn,"model":cfg.model,"effort":cfg.effort,"requested_service_tier":cfg.service_tier,"server_confirmed_service_tier":resumed["serviceTier"],"server_confirmed_model":resumed["model"],"server_confirmed_effort":resumed["reasoningEffort"],"prepared_at":now()}),
                 );
@@ -224,7 +243,7 @@ pub async fn refresh_policies(cfg: &Config, store: &Store) -> Result<Value> {
         };
         let (text, hash, _) = instructions(cfg, store, &e)?;
         let thread = b["thread_id"].as_str().unwrap();
-        let mut options = json!({"threadId":thread,"excludeTurns":true,"model":cfg.model,"cwd":cfg.lookup_workdir,"approvalPolicy":"never","sandbox":"read-only","config":{"model_reasoning_effort":cfg.effort},"developerInstructions":text});
+        let mut options = json!({"threadId":thread,"excludeTurns":true,"model":cfg.model,"cwd":cfg.lookup_workdir,"approvalPolicy":"never","sandbox":"read-only","config":{"model_reasoning_effort":cfg.effort,"features.hooks":false},"developerInstructions":text});
         if let Some(tier) = &cfg.service_tier {
             options["serviceTier"] = json!(tier)
         }
@@ -247,6 +266,9 @@ pub async fn deliver(
     plan: &Plan,
 ) -> Result<Value> {
     contact_policy(cfg)?; // Mandatory even for ACK/manual replay, before external write.
+    let mut canonical = plan.clone();
+    canonical.reply = crate::event::format_reply(&plan.reply)?;
+    let plan = &canonical;
     if !store.prepare(key, e, phase, plan)? {
         return Ok(json!({"status":"duplicate"}));
     }
@@ -303,6 +325,7 @@ pub async fn process(
             &Plan {
                 reply,
                 bundle_id: None,
+                sticker_id: None,
             },
         )
         .await?;

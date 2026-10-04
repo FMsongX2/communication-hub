@@ -24,6 +24,17 @@ pub struct Config {
     pub intro_text: Option<String>,
     #[serde(default)]
     pub service_tier: Option<String>,
+    #[serde(default)]
+    pub expressions: Option<ExpressionConfig>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpressionConfig {
+    pub catalog: PathBuf,
+    /// GIF delivery is disabled until animation preservation is verified on this installation.
+    #[serde(default)]
+    pub gif_verified: bool,
+    #[serde(default)]
+    pub emoticons: Option<PathBuf>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardConfig {
@@ -64,7 +75,7 @@ impl Config {
     }
     pub fn descriptors(&self) -> Value {
         json!([
-            {"provider":"kakao","enabled":self.kakao.enabled,"kind":"chat","transport":"macos_notification_and_ax","capabilities":["receive_calls","reply_text","approved_bundle_attachment"],"attachment_live_verified":false,"uses_pointer":false},
+            {"provider":"kakao","enabled":self.kakao.enabled,"kind":"chat","transport":"macos_notification_and_ax","capabilities":["receive_calls","reply_text","approved_bundle_attachment","approved_sticker_attachment"],"sticker_catalog_configured":self.expressions.is_some(),"gif_auto_enabled":self.expressions.as_ref().is_some_and(|c| c.gif_verified),"attachment_live_verified":false,"uses_pointer":false},
             {"provider":"discord","enabled":false,"kind":"chat","status":"adapter_not_implemented","capabilities":[]},
             {"provider":"slack","enabled":false,"kind":"chat","status":"adapter_not_implemented","capabilities":[]},
             {"provider":"notion","enabled":false,"kind":"documents_and_comments","status":"adapter_not_implemented","capabilities":[]}

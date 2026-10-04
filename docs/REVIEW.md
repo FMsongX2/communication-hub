@@ -19,3 +19,9 @@ Validation: 19 Rust contract tests, formatting and Clippy, native builds and a r
 An optional independent Opus review could not launch because this directory was not an Orca-managed worktree. No independent model endorsement is claimed.
 
 Remaining limitations: only KakaoTalk implemented; native attachment end-to-end validation pending; notification absence/truncation; UI localization and virtualized rows; configured account aliases rather than authenticated account detection; same-UID local trust; heuristic content checks; no automatic retention cleanup; experimental backend protocol; Accessibility queries can be slow on large histories. These are documented in both READMEs.
+
+### Optional expression delivery and wire prefix
+
+The Rust runner now carries an optional sticker ID from bounded operator-owned catalog candidates to a two-phase native delivery. Tests cover catalog path/hash rejection, original PNG/GIF bytes, unverified GIF gating, image-hash deduplication, room-scoped attempt cooldown, symlink staging rejection, attachment exclusivity, and code-generated prefix normalization. The 34 Rust tests and warning-free Clippy passed locally; the Swift sender compiled with AppKit/ApplicationServices.
+
+A controlled self-conversation on the operator Mac received its text and PNG in order. That Kakao version exposed no filename in the image bubble, so the initial native receipt correctly remained uncertain rather than claiming success; no automatic resend occurred. Completion detection now supports a filename-verified preview followed by a newly observed outgoing image bubble. GIF delivery/animation verification is separate, and is disabled by default. No live conversation data or third-party sticker assets are included in the repository.

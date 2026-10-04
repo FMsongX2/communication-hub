@@ -40,6 +40,10 @@ enum Command {
         #[arg(long)]
         file: PathBuf,
     },
+    ExpressionCandidates {
+        #[arg(long)]
+        file: PathBuf,
+    },
     ModelSmoke {
         #[arg(long)]
         file: PathBuf,
@@ -49,6 +53,8 @@ enum Command {
         file: PathBuf,
         #[arg(long)]
         reply: String,
+        #[arg(long)]
+        sticker: Option<String>,
         #[arg(long)]
         send: bool,
     },
@@ -129,6 +135,11 @@ async fn execute() -> Result<()> {
         Command::Ingest { file } => {
             daemon::request(&cfg.socket, json!({"method":"ingest","event":load(&file)?})).await?
         }
+        Command::ExpressionCandidates { file } => {
+            let e = load(&file)?;
+            cfg.validate_channel(&e.conversation.provider, &e.conversation.account)?;
+            communication_hub::expressions::candidates(&cfg, &Store::open(cfg.state.clone())?, &e)?
+        }
         Command::ModelSmoke { file } => {
             if cfg.external_auto_send || cfg.dispatch_enabled {
                 bail!("smoke_requires_isolated_non_dispatch_config")
@@ -139,7 +150,12 @@ async fn execute() -> Result<()> {
             e.validate(now(), store.session(&e.conversation)?.is_some())?;
             worker::model(&cfg, &store, &e).await?
         }
-        Command::DeliveryCheck { file, reply, send } => {
+        Command::DeliveryCheck {
+            file,
+            reply,
+            sticker,
+            send,
+        } => {
             if !send || !cfg.external_auto_send {
                 bail!("delivery_check_requires_explicit_send")
             }
@@ -162,6 +178,7 @@ async fn execute() -> Result<()> {
                 &Plan {
                     reply,
                     bundle_id: None,
+                    sticker_id: sticker,
                 },
             )
             .await?

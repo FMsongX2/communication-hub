@@ -4,6 +4,7 @@ pub mod config;
 pub mod daemon;
 pub mod dashboard;
 pub mod event;
+pub mod expressions;
 pub mod rpc;
 pub mod store;
 pub mod worker;

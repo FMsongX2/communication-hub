@@ -7,6 +7,21 @@ pub const PREFIX: &str = "[System-유이] : ";
 pub fn digest(bytes: impl AsRef<[u8]>) -> String {
     format!("{:x}", Sha256::digest(bytes.as_ref()))
 }
+/// The wire prefix belongs to the transport, not model generation.
+pub fn format_reply(body: &str) -> Result<String> {
+    let mut text = body.trim();
+    while let Some(rest) = text.strip_prefix(PREFIX.trim_end()) {
+        text = rest.trim_start();
+    }
+    if text.is_empty() {
+        bail!("empty_reply")
+    }
+    let reply = format!("{PREFIX}{text}");
+    if reply.chars().count() >= 8192 {
+        bail!("reply_too_long")
+    }
+    Ok(reply)
+}
 pub fn now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -116,25 +131,29 @@ impl Event {
 pub struct Plan {
     pub reply: String,
     pub bundle_id: Option<String>,
+    #[serde(default)]
+    pub sticker_id: Option<String>,
 }
 impl Plan {
     pub fn parse(text: &str, allowed: &Value) -> Result<Self> {
-        let p: Self = if text.trim_start().starts_with('{') {
+        let mut p: Self = if text.trim_start().starts_with('{') {
             serde_json::from_str(text)?
         } else {
             Self {
                 reply: text.trim().into(),
                 bundle_id: None,
+                sticker_id: None,
             }
         };
-        if !p.reply.starts_with(PREFIX) || p.reply.chars().count() >= 8192 {
-            bail!("invalid_reply_format")
-        }
+        p.reply = format_reply(&p.reply)?;
         if p.bundle_id
             .as_ref()
             .is_some_and(|id| allowed.get(id).is_none())
         {
             bail!("unauthorized_attachment_bundle")
+        }
+        if p.bundle_id.is_some() && p.sticker_id.is_some() {
+            bail!("multiple_attachment_types")
         }
         Ok(p)
     }

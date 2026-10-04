@@ -38,6 +38,7 @@ fn config(root: &Path) -> Config {
         dashboard: None,
         intro_text: None,
         service_tier: None,
+        expressions: None,
         kakao: KakaoConfig {
             enabled: true,
             account: "owner".into(),
@@ -103,6 +104,7 @@ fn restart_quarantines_in_flight_work_and_never_reclaims_sending() {
     let p = Plan {
         reply: "[System-유이] : fixture".into(),
         bundle_id: None,
+        sticker_id: None,
     };
     s.prepare(&e.key(), &e, "final", &p).unwrap();
     assert!(s.claim_delivery(&e.key()).unwrap());
@@ -247,7 +249,10 @@ fn attachment_plan_cannot_expand_authorized_ids() {
         )
         .is_err()
     );
-    assert!(Plan::parse("unprefixed", &json!({})).is_err());
+    assert_eq!(
+        Plan::parse("unprefixed", &json!({})).unwrap().reply,
+        "[System-유이] : unprefixed"
+    );
     assert!(
         Plan::parse(
             r#"{"reply":"[System-유이] : 준비할게요!","bundle_id":null}"#,
@@ -383,6 +388,7 @@ async fn model_protocol_preserves_policy_model_untrusted_input_and_final_only() 
         start["params"]["config"]["model_reasoning_effort"],
         "medium"
     );
+    assert_eq!(start["params"]["config"]["features.hooks"], false);
     assert!(
         start["params"]["developerInstructions"]
             .as_str()
@@ -438,6 +444,7 @@ async fn resumed_session_reloads_updated_policy() {
         .find(|x| x["method"] == "thread/resume")
         .unwrap();
     assert_eq!(resume["params"]["threadId"], "fixture-thread");
+    assert_eq!(resume["params"]["config"]["features.hooks"], false);
     assert!(
         resume["params"]["developerInstructions"]
             .as_str()
@@ -606,6 +613,7 @@ fn historical_log_does_not_invent_original_body_or_trigger() {
     let p = Plan {
         reply: "[System-유이] : fixture".into(),
         bundle_id: None,
+        sticker_id: None,
     };
     s.prepare("receipt", &e, "final", &p).unwrap();
     s.db()
@@ -926,4 +934,158 @@ async fn fast_tier_is_forwarded_without_changing_model_or_effort() {
         "medium"
     );
     server.abort();
+}
+
+fn expression_fixture(t: &TempDir) -> (Config, Vec<u8>) {
+    use zip::write::SimpleFileOptions;
+    let mut cfg = config(t.path());
+    let assets = t.path().join("assets");
+    std::fs::create_dir(&assets).unwrap();
+    let png = b"\x89PNG\r\n\x1a\nfixture".to_vec();
+    let gif = b"GIF89afixture".to_vec();
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(assets.join("pictures.zip")).unwrap());
+    zip.start_file("original.png", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(&png).unwrap();
+    zip.start_file("original.gif", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(&gif).unwrap();
+    zip.finish().unwrap();
+    let row = |id: &str, data: &[u8], format: &str, eligible: bool| json!({"id":id,"category":"인사","visual_meaning":"반가운 인사","suitable_situations":["인사"],"avoid_context":["슬픈 소식"],"random_eligible":eligible,"format":format,"sha256":communication_hub::event::digest(data),"archive":"pictures.zip","archive_path":format!("original.{}",format.to_lowercase())});
+    std::fs::write(assets.join("catalog.json"),serde_json::to_vec(&json!({"items":[row("one",&png,"PNG",true),row("duplicate",&png,"PNG",true),row("animated",&gif,"GIF",true),row("restricted",b"different","PNG",false)]})).unwrap()).unwrap();
+    cfg.expressions = Some(communication_hub::config::ExpressionConfig {
+        catalog: assets.join("catalog.json"),
+        gif_verified: false,
+        emoticons: None,
+    });
+    (cfg, png)
+}
+#[test]
+fn expression_candidates_deduplicate_and_respect_room_scoped_cooldown() {
+    use communication_hub::expressions;
+    let t = TempDir::new().unwrap();
+    let (cfg, png) = expression_fixture(&t);
+    let s = Store::open(cfg.state.clone()).unwrap();
+    let e = event();
+    let candidates = expressions::candidates(&cfg, &s, &e).unwrap();
+    assert_eq!(candidates.as_array().unwrap().len(), 1);
+    assert_eq!(candidates[0]["avoid"], json!(["슬픈 소식"]));
+    s.reserve_expression(
+        "attempt",
+        &e.conversation,
+        &communication_hub::event::digest(png),
+        "인사",
+    )
+    .unwrap();
+    assert!(
+        expressions::candidates(&cfg, &s, &e)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let mut other = e.clone();
+    other.conversation.id = "other-room".into();
+    assert_eq!(
+        expressions::candidates(&cfg, &s, &other)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        !s.reserve_expression("attempt", &e.conversation, "other", "other")
+            .unwrap()
+    );
+    assert!(
+        expressions::candidates(&cfg, &s, &e)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+#[test]
+fn expression_preparation_preserves_bytes_and_rejects_unverified_gif() {
+    use communication_hub::{event::digest, expressions};
+    let t = TempDir::new().unwrap();
+    let (mut cfg, png) = expression_fixture(&t);
+    let key = digest("fixture");
+    let result = expressions::prepare(&cfg, &key, "one").unwrap();
+    assert_eq!(
+        std::fs::read(result["path"].as_str().unwrap()).unwrap(),
+        png
+    );
+    assert!(expressions::prepare(&cfg, &key, "animated").is_err());
+    cfg.expressions.as_mut().unwrap().gif_verified = true;
+    let gif = expressions::prepare(&cfg, &key, "animated").unwrap();
+    assert_eq!(
+        std::fs::read(gif["path"].as_str().unwrap()).unwrap(),
+        b"GIF89afixture"
+    );
+    assert!(expressions::prepare(&cfg, &key, "restricted").is_err());
+    assert!(expressions::prepare(&cfg, "../../invalid", "one").is_err());
+}
+#[test]
+fn expression_catalog_rejects_hash_and_path_changes() {
+    use communication_hub::{event::digest, expressions};
+    let t = TempDir::new().unwrap();
+    let (cfg, _) = expression_fixture(&t);
+    let path = &cfg.expressions.as_ref().unwrap().catalog;
+    let mut catalog: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    catalog["items"][0]["sha256"] = json!("0".repeat(64));
+    std::fs::write(path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+    assert!(expressions::prepare(&cfg, &digest("fixture"), "one").is_err());
+    catalog["items"][0]["archive_path"] = json!("../private.png");
+    std::fs::write(path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+    assert!(expressions::prepare(&cfg, &digest("fixture"), "one").is_err());
+}
+#[test]
+fn expression_plan_cannot_select_unoffered_or_multiple_attachments() {
+    use communication_hub::expressions;
+    let offered = json!([{"id":"one"}]);
+    let mut p = Plan {
+        reply: "[System-유이] : hello".into(),
+        bundle_id: None,
+        sticker_id: Some("one".into()),
+    };
+    expressions::validate_plan(&p, &offered).unwrap();
+    p.sticker_id = Some("not-offered".into());
+    assert!(expressions::validate_plan(&p, &offered).is_err());
+    assert!(
+        Plan::parse(
+            r#"{"reply":"[System-유이] : hello","bundle_id":"bundle","sticker_id":"one"}"#,
+            &json!({"bundle":{}})
+        )
+        .is_err()
+    );
+}
+#[cfg(unix)]
+#[test]
+fn expression_staging_rejects_symlink_outside_ipc() {
+    use communication_hub::{event::digest, expressions};
+    let t = TempDir::new().unwrap();
+    let (cfg, _) = expression_fixture(&t);
+    std::fs::create_dir(&cfg.kakao.sender_ipc).unwrap();
+    let outside = t.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, cfg.kakao.sender_ipc.join("file-jobs")).unwrap();
+    assert!(expressions::prepare(&cfg, &digest("fixture"), "one").is_err());
+    assert!(std::fs::read_dir(outside).unwrap().next().is_none());
+}
+
+#[test]
+fn wire_prefix_is_generated_once_for_new_and_legacy_model_output() {
+    use communication_hub::event::format_reply;
+    assert_eq!(
+        format_reply("본문만 작성했어!").unwrap(),
+        "[System-유이] : 본문만 작성했어!"
+    );
+    assert_eq!(
+        format_reply("[System-유이] : [System-유이] : 본문").unwrap(),
+        "[System-유이] : 본문"
+    );
+    assert!(format_reply("[System-유이] : ").is_err());
+    assert!(format_reply(&"x".repeat(8192)).is_err());
 }

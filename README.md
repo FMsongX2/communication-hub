@@ -109,3 +109,19 @@ MIT licensed. OpenKakao-derived notification and AX selection conventions retain
 Each invocation reloads Contact-Other. When the assembled operator context changes, the hub appends a current developer message through `thread/inject_items` before generation. It preserves prior work history instead of replacing the session; merely passing resume overrides is not treated as proof that a loaded model used the revision. To refresh existing idle bindings without generating or sending messages: `communication-hub pause`, `communication-hub refresh-policy`, then `communication-hub resume`. Active backend turns are not modified.
 
 `intro_text` optionally controls the deterministic first acknowledgement's introduction. Fixed acknowledgement variants use brief informal Korean. Configure `service_tier` (e.g. `"priority"` for a catalog-advertised Fast tier) only when your backend/model supports it. The hub forwards it at both session and turn boundaries, independently of `model` and `effort`. Fast can consume more allowance; a configured tier is not a latency guarantee.
+
+## Optional expression catalog
+
+Set `expressions` in the private config to use an operator-owned sticker catalog:
+
+```json
+{"expressions":{"catalog":"/absolute/private/assets/catalog.json","gif_verified":false,"emoticons":null}}
+```
+
+Catalog items contain `id`, `category`, `visual_meaning`, `suitable_situations`, `avoid_context`, `random_eligible`, `format` (`PNG` or `GIF`), `sha256`, `archive` (a sibling ZIP basename), and `archive_path`. The runtime provides up to 32 candidate descriptions, deduplicates image hashes, excludes the last 12 room-scoped image attempts, and deprioritizes the last six expression families. Lexical ranking only nominates candidates; the model checks their meaning and avoid conditions before choosing an offered `sticker_id` or `null`. Restricted memes are excluded from automatic selection. Approved work ZIPs and stickers cannot be selected together.
+
+The native sender first confirms the text bubble and empty composer. Only then does Rust verify ZIP CRC, image signature, size, and SHA-256, stage the original image, and request `attachment_only`. That phase rechecks the exact room, trigger, prior text, and empty composer before pasting the file URL. Image previews and completion markers must be observed; ambiguous results are held and never automatically retried. An owner draft restored after text delivery can hold the image phase. Failed/uncertain image attempts remain labeled unverified in history to avoid repeating them blindly.
+
+GIF bytes are never re-encoded, but automatic GIF selection stays disabled until animation preservation has been verified on that installation. The image transport is experimental until live preview/receipt verification succeeds. Optional `emoticons` points to private JSON with an `items` array containing `{ "text": "…", "situations": ["…"] }` records. Missing original collections are not invented. Sticker art, catalogs, and conversation histories are not distributed with this repository; obtain appropriate rights for your own assets.
+
+The wire prefix `[System-유이] : ` is added once by code. The model generates only the body; legacy prefixed output is normalized before journaling and sending. On Kakao versions without image filenames in bubbles, completion uses a filename-verified preview followed by a new outgoing image bubble (right alignment, share control, no text/ZIP payload) in the same verified conversation. This is a UI observation, not a recipient read receipt.

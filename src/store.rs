@@ -30,9 +30,37 @@ impl Store {
             CREATE TABLE IF NOT EXISTS migrations(name TEXT PRIMARY KEY);")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS call_log(event_key TEXT PRIMARY KEY,conversation TEXT NOT NULL,message_id TEXT NOT NULL,occurred REAL NOT NULL,trigger_kind TEXT NOT NULL,notification_title TEXT NOT NULL,body TEXT);
             CREATE TABLE IF NOT EXISTS session_policy(conversation TEXT PRIMARY KEY,hash TEXT NOT NULL,applied REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS expression_history(delivery TEXT PRIMARY KEY,conversation TEXT NOT NULL,sha256 TEXT NOT NULL,family TEXT NOT NULL,created REAL NOT NULL,verified INTEGER NOT NULL DEFAULT 0);
+            CREATE INDEX IF NOT EXISTS expression_room_time ON expression_history(conversation,created DESC);
             CREATE INDEX IF NOT EXISTS call_log_conversation ON call_log(conversation);")?;
         std::fs::set_permissions(&s.path, std::fs::Permissions::from_mode(0o600))?;
         Ok(s)
+    }
+    pub fn expression_history(&self, c: &Conversation) -> Result<Vec<(String, String)>> {
+        let db = self.db()?;
+        let mut q = db.prepare("SELECT sha256,family FROM expression_history WHERE conversation=? ORDER BY created DESC LIMIT 12")?;
+        Ok(q.query_map([c.key()], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    // Reserve before UI side effects: an uncertain attempt also must not be repeated blindly.
+    pub fn reserve_expression(
+        &self,
+        key: &str,
+        c: &Conversation,
+        sha: &str,
+        family: &str,
+    ) -> Result<bool> {
+        Ok(self.db()?.execute(
+            "INSERT OR IGNORE INTO expression_history VALUES(?,?,?,?,?,0)",
+            params![key, c.key(), sha, family, now()],
+        )? == 1)
+    }
+    pub fn verify_expression(&self, key: &str) -> Result<()> {
+        self.db()?.execute(
+            "UPDATE expression_history SET verified=1 WHERE delivery=?",
+            [key],
+        )?;
+        Ok(())
     }
     pub fn db(&self) -> Result<Connection> {
         let c = Connection::open(&self.path)?;

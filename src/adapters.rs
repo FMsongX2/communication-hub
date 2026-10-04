@@ -3,6 +3,7 @@ use crate::{
     attachments,
     config::{Config, atomic, json_file, private_dir},
     event::{Event, Plan, digest},
+    expressions,
     store::Store,
 };
 use anyhow::{Result, bail};
@@ -38,6 +39,7 @@ impl Adapter for Kakao {
         if !plan.reply.starts_with(crate::event::PREFIX) {
             bail!("invalid_reply_prefix")
         }
+        expressions::validate_plan(plan, &expressions::candidates(&self.cfg, store, e)?)?;
         let route = store.route(&e.conversation)?;
         let name = route.as_deref().unwrap_or(&e.title);
         if name.is_empty() {
@@ -60,35 +62,12 @@ impl Adapter for Kakao {
             };
             p["attachment_path"] = artifact["path"].clone();
         }
-        let request = nonce()?;
-        let base = &self.cfg.kakao.sender_ipc;
-        private_dir(base)?;
-        let path = base.join("sender-requests").join(format!("{request}.json"));
-        atomic(&path, &p)?;
-        let receipt = base.join("sender-receipts").join(format!("{request}.json"));
-        let result = self.invoke_sender(&request, &receipt).await;
-        let _ = std::fs::remove_file(&path);
-        let mut result = result?;
-        if result["status"] == "sending" {
-            result["status"] = json!("sending_uncertain")
-        }
-        if !matches!(
-            result["status"].as_str(),
-            Some("sent_verified" | "held" | "partial_file_held" | "sending_uncertain")
-        ) {
-            return Ok(json!({"status":"sending_uncertain","reason":"unknown_native_result"}));
-        }
-        if result["status"] == "sent_verified"
-            && (result["text_sent"] != true
-                || result["verified_chat_name"]
-                    .as_str()
-                    .is_none_or(str::is_empty)
-                || plan.bundle_id.is_some() && result["attachment_sent"] != true)
-        {
-            return Ok(
-                json!({"status":"sending_uncertain","reason":"incomplete_native_verification"}),
-            );
-        }
+        let mut result = self.native_request(&p).await?;
+        validate_receipt(
+            &mut result,
+            route.as_deref().unwrap_or(""),
+            plan.bundle_id.is_some(),
+        );
         if let Some(name) = result["verified_chat_name"].as_str() {
             if route.as_ref().is_some_and(|expected| expected != name) {
                 return Ok(json!({"status":"sending_uncertain","reason":"native_target_mismatch"}));
@@ -96,10 +75,103 @@ impl Adapter for Kakao {
             store.save_route(&e.conversation, name)?;
         }
         store.note_intro(&e.conversation, &plan.reply, &result)?;
+        if let Some(id) = &plan.sticker_id {
+            // No image extraction, staging or UI side effect before a verified text receipt.
+            if result["status"] != "sent_verified" {
+                return Ok(result);
+            }
+            let cfg = self.cfg.clone();
+            let job = key.to_owned();
+            let selected = id.clone();
+            let artifact = match tokio::task::spawn_blocking(move || {
+                expressions::prepare(&cfg, &job, &selected)
+            })
+            .await
+            {
+                Ok(Ok(v)) => v,
+                _ => {
+                    return Ok(
+                        json!({"status":"partial_file_held","reason":"sticker_preparation_failed","text_sent":true,"attachment_sent":false,"text_receipt":result}),
+                    );
+                }
+            };
+            if !store.reserve_expression(
+                key,
+                &e.conversation,
+                artifact["sha256"].as_str().unwrap(),
+                artifact["family"].as_str().unwrap(),
+            )? {
+                return Ok(
+                    json!({"status":"partial_file_held","reason":"sticker_attempt_already_recorded","text_sent":true,"attachment_sent":false,"text_receipt":result}),
+                );
+            }
+            let verified_name = result["verified_chat_name"].as_str().unwrap();
+            let request = json!({"chat_name":verified_name,"room_name_verified":true,"trigger_body":e.body,
+                "reply":plan.reply,"phase":"attachment_only","prior_text_verified":true,
+                "attachment_path":artifact["path"],"expires_at":crate::event::now()+75.0});
+            let mut image = match self.native_request(&request).await {
+                Ok(v) => v,
+                Err(_) => {
+                    json!({"status":"sending_uncertain","reason":"attachment_transport_uncertain"})
+                }
+            };
+            validate_receipt(&mut image, verified_name, true);
+            if image["status"] == "sent_verified" {
+                store.verify_expression(key)?;
+            } else if image["status"] == "held" {
+                image["status"] = json!("partial_file_held");
+            }
+            image["text_sent"] = json!(true);
+            image["text_receipt"] = result;
+            let mut metadata = artifact;
+            metadata.as_object_mut().unwrap().remove("path");
+            image["sticker"] = metadata;
+            return Ok(image);
+        }
         Ok(result)
     }
 }
+fn validate_receipt(result: &mut Value, expected: &str, attachment: bool) {
+    if result["status"] == "sending" {
+        result["status"] = json!("sending_uncertain");
+    }
+    if !matches!(
+        result["status"].as_str(),
+        Some("sent_verified" | "held" | "partial_file_held" | "sending_uncertain")
+    ) {
+        *result = json!({"status":"sending_uncertain","reason":"unknown_native_result"});
+        return;
+    }
+    if result["status"] == "sent_verified"
+        && (result["text_sent"] != true
+            || result["verified_chat_name"]
+                .as_str()
+                .is_none_or(str::is_empty)
+            || attachment && result["attachment_sent"] != true)
+    {
+        *result = json!({"status":"sending_uncertain","reason":"incomplete_native_verification"});
+        return;
+    }
+    if !expected.is_empty()
+        && result["verified_chat_name"]
+            .as_str()
+            .is_some_and(|n| n != expected)
+    {
+        *result = json!({"status":"sending_uncertain","reason":"native_target_mismatch"});
+    }
+}
 impl Kakao {
+    async fn native_request(&self, p: &Value) -> Result<Value> {
+        let request = nonce()?;
+        let base = &self.cfg.kakao.sender_ipc;
+        private_dir(base)?;
+        let path = base.join("sender-requests").join(format!("{request}.json"));
+        atomic(&path, p)?;
+        let receipt = base.join("sender-receipts").join(format!("{request}.json"));
+        let result = self.invoke_sender(&request, &receipt).await;
+        let _ = std::fs::remove_file(path);
+        result
+    }
     async fn invoke_sender(&self, request: &str, receipt: &Path) -> Result<Value> {
         let launch = tokio::time::timeout(
             Duration::from_secs(8),
