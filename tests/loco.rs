@@ -39,7 +39,7 @@ fn fixture(mode: &str) -> (TempDir, Config, Store, Event) {
         title: "Fixture".into(),
         occurred_at: now(),
         source: LOCO_SOURCE.into(),
-        metadata: json!({}),
+        metadata: json!({"approval_epoch":"1"}),
         agent: Agent::Yui,
     };
     store
@@ -51,7 +51,7 @@ fn fixture(mode: &str) -> (TempDir, Config, Store, Event) {
     (t, cfg, store, event)
 }
 fn raw() -> Value {
-    json!({"mode":"active","user_id":"123","chat_id":"456","log_id":"789","author_id":"123", "body":"@[유이] inspect fixture","sent_at":now(),"title":"Fixture"})
+    json!({"approval_epoch":"1","mode":"active","user_id":"123","chat_id":"456","log_id":"789","author_id":"123", "body":"@[유이] inspect fixture","sent_at":now(),"title":"Fixture"})
 }
 fn sent() -> Value {
     json!({"status":"sent_verified","transport":"loco","user_id":"123","chat_id":"456","text_sent":true,"attachment_sent":false,"input_started":true,"side_effects_started":true,"text_log_id":"900"})
@@ -162,7 +162,7 @@ fn ingress_requires_exact_account_existing_mapping_and_keeps_owner_calls() {
     input["log_id"] = json!("790");
     assert_eq!(
         ingest_loco(&cfg, &store, &input, &Notify::new(), false).unwrap()["reason"],
-        "loco_room_not_registered"
+        "loco_unmapped_chat"
     );
 }
 #[test]
@@ -348,7 +348,7 @@ fn shadow_active_mode_mismatch_never_dispatches() {
     }
 }
 fn auth_request(e: &Event, component: &str) -> Value {
-    json!({"delivery_id":e.key(),"user_id":"123","chat_id":"456","component":component})
+    json!({"delivery_id":e.key(),"user_id":"123","chat_id":"456","component":component,"approval_epoch":e.metadata["approval_epoch"]})
 }
 fn stamp(cfg: &Config, e: &mut Event) {
     e.metadata["__hub_authorization_stamp"] =
@@ -451,12 +451,14 @@ fn component_authorization_rechecks_every_current_revocation_boundary() {
                     .unwrap();
             }
             "mapping" => {
-                cfg.kakao
-                    .loco
-                    .as_mut()
+                store
+                    .db()
                     .unwrap()
-                    .rooms
-                    .insert(e.conversation.id.clone(), "999".into());
+                    .execute(
+                        "UPDATE loco_bindings SET deleted=1,epoch=epoch+1 WHERE conversation=?",
+                        [e.conversation.key()],
+                    )
+                    .unwrap();
             }
             "mode" => cfg.kakao.loco.as_mut().unwrap().mode = LocoMode::Shadow,
             "external_send" => cfg.external_auto_send = false,

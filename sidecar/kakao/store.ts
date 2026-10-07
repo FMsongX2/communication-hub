@@ -14,6 +14,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS cursors (chat_id TEXT PRIMARY KEY, log_id TEXT NOT NULL, bootstrap_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS approval_epochs (chat_id TEXT PRIMARY KEY, epoch TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS outgoing (chat_id TEXT NOT NULL, log_id TEXT NOT NULL, PRIMARY KEY(chat_id,log_id));`);
     const row=this.db.query('SELECT value FROM metadata WHERE key=?').get('user_id') as {value:string}|null;
     if(row && row.value!==userId) {this.db.close();throw new Error('state_account_mismatch');}
@@ -40,6 +41,31 @@ export class Store {
     const previous=this.cursor(chat);
     if(previous===null)throw new Error('cursor_not_bootstrapped');
     if(BigInt(log)>BigInt(previous))this.db.query('UPDATE cursors SET log_id=? WHERE chat_id=?').run(log,chat);
+  }
+  /** Persist only valid Hub policy. Temporary Hub failure must not erase receive history. */
+  applyApprovalEpochs(epochs:ReadonlyMap<string,string>,initialStaticIds:ReadonlySet<string>=new Set()) {
+    this.db.transaction(()=>{
+      const initialized=!!this.db.query("SELECT 1 FROM metadata WHERE key='dynamic_policy_initialized'").get();
+      const rows=this.db.query('SELECT chat_id,epoch FROM approval_epochs').all() as Array<{chat_id:string;epoch:string}>;
+      for(const row of rows)if(epochs.get(row.chat_id)!==row.epoch) {
+        this.db.query('DELETE FROM cursors WHERE chat_id=?').run(row.chat_id);
+        this.db.query('DELETE FROM approval_epochs WHERE chat_id=?').run(row.chat_id);
+      }
+      for(const [chat,epoch] of epochs) {
+        const old=rows.find(row=>row.chat_id===chat);
+        if(old?.epoch!==epoch) {
+          // One-time static upgrade may adopt only an unchanged initial Hub grant.
+          const adopt=!initialized&&!old&&epoch==='1'&&initialStaticIds.has(chat);
+          if(!adopt)this.db.query('DELETE FROM cursors WHERE chat_id=?').run(chat);
+          this.db.query('INSERT OR REPLACE INTO approval_epochs VALUES (?,?)').run(chat,epoch);
+        }
+      }
+      this.db.query("INSERT OR REPLACE INTO metadata VALUES ('dynamic_policy_initialized','1')").run();
+      // Migrating from static config must not retain revoked static cursors.
+      for(const row of this.db.query('SELECT chat_id FROM cursors').all() as Array<{chat_id:string}>) {
+        if(!epochs.has(row.chat_id))this.db.query('DELETE FROM cursors WHERE chat_id=?').run(row.chat_id);
+      }
+    })();
   }
   close() {this.db.close();}
 }

@@ -24,16 +24,18 @@ const validAck=(r:SDKReceipt,chat:string)=>r?.success===true&&r.status_code===0&
 
 export class Sender {
   private tail:Promise<unknown>=Promise.resolve();
-  constructor(readonly config:Config,readonly client:Client,readonly store:Store,readonly permitted:()=>boolean=()=>true,readonly authorize:(request:{delivery_id:string;user_id:string;chat_id:string;component:'text'|'attachment'})=>Promise<boolean>=async()=>false) {}
+  constructor(readonly config:Config,readonly client:Client,readonly store:Store,readonly permitted:()=>boolean=()=>true,readonly authorize:(request:{delivery_id:string;user_id:string;chat_id:string;component:'text'|'attachment';approval_epoch?:string})=>Promise<boolean>=async()=>false,readonly scope:(chat:string)=>string|null=chat=>config.allowed_chat_ids.includes(chat)?'static':null,readonly approvalEpoch:(chat:string)=>string|undefined=()=>undefined) {}
   send(raw:unknown):Promise<Receipt> {
-    const job=this.tail.then(()=>this.execute(raw));this.tail=job.catch(()=>{});return job;
+    const chat=(raw as {chat_id?:unknown})?.chat_id;const scope=typeof chat==='string'?this.scope(chat):null;
+    const job=this.tail.then(()=>this.execute(raw,scope));this.tail=job.catch(()=>{});return job;
   }
-  private async execute(raw:unknown):Promise<Receipt> {
+  private async execute(raw:unknown,scope:string|null):Promise<Receipt> {
     const p=SendSchema.parse(raw);
     const base:Receipt={status:'held',transport:'loco',user_id:this.config.expected_user_id,chat_id:p.chat_id,text_sent:false,attachment_sent:false,input_started:false,side_effects_started:false};
     const held=(reason:string):Receipt=>({...base,reason});
     if(p.expected_user_id!==this.config.expected_user_id||this.client.getCredentials().userId!==this.config.expected_user_id)return held('wrong_account');
-    if(!this.config.allowed_chat_ids.includes(p.chat_id))return held('room_not_approved');
+    const inScope=()=>scope!==null&&this.scope(p.chat_id)===scope&&(!this.config.dynamic_room_policy||p.approval_epoch===this.approvalEpoch(p.chat_id));
+    if(!inScope())return held('room_not_approved');
     const fingerprint=sha(JSON.stringify(p));const old=this.store.delivery(p.delivery_id);
     if(old)return old.fingerprint===fingerprint?old.result:held('delivery_id_conflict');
     if(this.config.mode!=='active')return held('shadow_mode');
@@ -44,12 +46,12 @@ export class Sender {
     if(p.expires_at<=Date.now()/1000)return held('expired');
     // Acquire before dispatch. Failures here are known not to have written anything.
     try {await this.client.acquireSession();}catch{return held('not_connected');}
-    if(!this.permitted()||p.expires_at<=Date.now()/1000)return held('transport_not_ready_or_expired');
+    if(!inScope()||!this.permitted()||p.expires_at<=Date.now()/1000)return held('transport_not_ready_or_expired');
     const allowed=async(component:'text'|'attachment')=>{
-      try{return await this.authorize({delivery_id:p.delivery_id,user_id:this.config.expected_user_id,chat_id:p.chat_id,component})===true;}catch{return false;}
+      try{return await this.authorize({delivery_id:p.delivery_id,user_id:this.config.expected_user_id,chat_id:p.chat_id,component,...(this.config.dynamic_room_policy?{approval_epoch:this.approvalEpoch(p.chat_id)}:{})})===true;}catch{return false;}
     };
     if(!await allowed(p.reply?'text':'attachment'))return held('hub_authorization_denied_or_unavailable');
-    if(!this.permitted()||p.expires_at<=Date.now()/1000)return held('transport_not_ready_or_expired');
+    if(!inScope()||!this.permitted()||p.expires_at<=Date.now()/1000)return held('transport_not_ready_or_expired');
     let result:Receipt={...base,status:'sending_uncertain',reason:'dispatch_in_flight',input_started:true,side_effects_started:true};
     this.store.begin(p.delivery_id,fingerprint,result); // fsynced before any write
     try {
@@ -59,7 +61,7 @@ export class Sender {
         result={...result,text_sent:true,text_log_id:ack.log_id};this.store.receipt(p.delivery_id,result);
       }
       if(file) {
-        if(p.expires_at<=Date.now()/1000||!this.permitted()||(!!p.reply&&!await allowed('attachment'))||p.expires_at<=Date.now()/1000||!this.permitted()) {
+        if(!inScope()||p.expires_at<=Date.now()/1000||!this.permitted()||(!!p.reply&&!await allowed('attachment'))||p.expires_at<=Date.now()/1000||!inScope()||!this.permitted()) {
           result={...result,status:result.text_sent?'partial_file_held':'held',reason:'attachment_not_dispatched'};
           this.store.receipt(p.delivery_id,result);return result;
         }

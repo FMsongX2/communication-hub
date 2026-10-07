@@ -416,7 +416,7 @@ pub fn prepare(cfg: &Config, e: &Event, key: &str, id: &str) -> Result<Value> {
         None => {}
         Some(Value::String(mode)) if mode == "zip" => {}
         Some(Value::String(mode)) if mode == "original" => {
-            if cfg.kakao.loco_target(&e.conversation).is_none() {
+            if crate::loco::target_from_disk(cfg, &e.conversation)?.is_none() {
                 bail!("original_requires_active_loco_room")
             }
             return prepare_original(cfg, key, id, b);

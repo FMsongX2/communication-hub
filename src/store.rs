@@ -12,6 +12,28 @@ pub struct Store {
     pub path: PathBuf,
     pub store_bodies: bool,
 }
+type LocoCounts = std::collections::BTreeMap<(String, String), usize>;
+fn loco_counts(db: &Connection) -> Result<LocoCounts> {
+    let mut q=db.prepare("SELECT b.user_id,b.conversation FROM loco_bindings b JOIN rooms r ON r.conversation=b.conversation WHERE b.deleted=0 AND r.approved IS NOT NULL AND (r.yui=1 OR r.yumi=1)")?;
+    let mut counts = LocoCounts::new();
+    for row in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+        let (user, key) = row?;
+        let [provider, account, _]: [String; 3] = serde_json::from_str(&key)?;
+        if provider == "kakao" {
+            *counts.entry((user, account)).or_default() += 1;
+        }
+    }
+    Ok(counts)
+}
+/// Check under the same IMMEDIATE transaction as the mutation; errors roll back epochs too.
+fn enforce_loco_growth(db: &Connection, before: &LocoCounts) -> Result<()> {
+    for (scope, after) in loco_counts(db)? {
+        if after > crate::loco::MAX_POLICY_ROOMS && after > *before.get(&scope).unwrap_or(&0) {
+            return Err(crate::loco::RoomLimitReached.into());
+        }
+    }
+    Ok(())
+}
 impl Store {
     pub fn open(state: PathBuf) -> Result<Self> {
         use std::os::unix::fs::PermissionsExt;
@@ -40,6 +62,13 @@ impl Store {
             CREATE TABLE IF NOT EXISTS loco_ingress(key TEXT PRIMARY KEY,conversation TEXT NOT NULL,body_hash TEXT NOT NULL,receipt TEXT NOT NULL,created REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS message_sources(conversation TEXT NOT NULL,digest TEXT NOT NULL,source TEXT NOT NULL,occurred REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS message_sources_room ON message_sources(conversation,digest);")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS loco_bindings(conversation TEXT PRIMARY KEY,user_id TEXT NOT NULL,chat_id TEXT NOT NULL,metadata TEXT NOT NULL DEFAULT '{}',deleted INTEGER NOT NULL DEFAULT 0,epoch INTEGER NOT NULL DEFAULT 1,UNIQUE(user_id,chat_id));
+            CREATE TABLE IF NOT EXISTS loco_policy_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision INTEGER NOT NULL);
+            INSERT OR IGNORE INTO loco_policy_revision VALUES(1,0);
+            CREATE TRIGGER IF NOT EXISTS loco_room_updated AFTER UPDATE OF approved,yui,yumi,context_reset_at ON rooms BEGIN UPDATE loco_bindings SET epoch=epoch+1 WHERE conversation=NEW.conversation; UPDATE loco_policy_revision SET revision=revision+1 WHERE id=1; END;
+            CREATE TRIGGER IF NOT EXISTS loco_room_deleted AFTER DELETE ON rooms BEGIN UPDATE loco_bindings SET deleted=1,epoch=epoch+1 WHERE conversation=OLD.conversation; UPDATE loco_policy_revision SET revision=revision+1 WHERE id=1; END;
+            CREATE TRIGGER IF NOT EXISTS loco_binding_added AFTER INSERT ON loco_bindings BEGIN UPDATE loco_policy_revision SET revision=revision+1 WHERE id=1; END;
+            CREATE TRIGGER IF NOT EXISTS loco_binding_updated AFTER UPDATE ON loco_bindings BEGIN UPDATE loco_policy_revision SET revision=revision+1 WHERE id=1; END;")?;
         // Rooms already answered in (a verified name) were in use before the registry existed.
         db.execute(
             "INSERT OR IGNORE INTO rooms(conversation,title,approved,seen) SELECT conversation,title,?1,?1 FROM routes WHERE title IS NOT NULL AND NOT EXISTS(SELECT 1 FROM migrations WHERE name='rooms-v1')",
@@ -62,6 +91,152 @@ impl Store {
         }
         std::fs::set_permissions(&s.path, std::fs::Permissions::from_mode(0o600))?;
         Ok(s)
+    }
+    /// Import static mappings exactly once per account. Deleted mappings remain tombstones.
+    pub fn seed_loco(&self, cfg: &Config) -> Result<()> {
+        let Some(loco) = &cfg.kakao.loco else {
+            return Ok(());
+        };
+        loco.validate()?;
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let before = loco_counts(&tx)?;
+        let migration = format!(
+            "loco-bindings-v1:{}:{}",
+            cfg.kakao.account, loco.expected_user_id
+        );
+        if !tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM migrations WHERE name=?)",
+            [&migration],
+            |r| r.get::<_, bool>(0),
+        )? {
+            for (room_id, chat_id) in &loco.rooms {
+                let c = Conversation {
+                    provider: "kakao".into(),
+                    account: cfg.kakao.account.clone(),
+                    id: room_id.clone(),
+                };
+                tx.execute("INSERT OR IGNORE INTO loco_bindings(conversation,user_id,chat_id) VALUES(?,?,?)",params![c.key(),loco.expected_user_id,chat_id])?;
+            }
+            tx.execute("INSERT INTO migrations VALUES(?)", [migration])?;
+        }
+        enforce_loco_growth(&tx, &before)?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn loco_binding(&self, cfg: &Config, c: &Conversation) -> Result<Option<Value>> {
+        self.seed_loco(cfg)?;
+        if c.provider != "kakao" || c.account != cfg.kakao.account {
+            return Ok(None);
+        }
+        let Some(loco) = &cfg.kakao.loco else {
+            return Ok(None);
+        };
+        Ok(self.db()?.query_row("SELECT chat_id,deleted,epoch,metadata FROM loco_bindings WHERE conversation=? AND user_id=?",params![c.key(),loco.expected_user_id],|r|Ok(json!({"chat_id":r.get::<_,String>(0)?,"deleted":r.get::<_,bool>(1)?,"approval_epoch":r.get::<_,i64>(2)?.to_string(),"metadata":serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or(Value::Null)}))).optional()?)
+    }
+    pub fn loco_policy(&self, cfg: &Config) -> Result<Value> {
+        self.seed_loco(cfg)?;
+        let loco = cfg
+            .kakao
+            .loco
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("loco_not_configured"))?;
+        let db = self.db()?;
+        // A read transaction keeps the revision and grants from the same snapshot.
+        db.execute_batch("BEGIN DEFERRED")?;
+        let revision: i64 = db.query_row(
+            "SELECT revision FROM loco_policy_revision WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut q=db.prepare("SELECT b.conversation,b.chat_id,r.title,b.epoch FROM loco_bindings b JOIN rooms r ON r.conversation=b.conversation WHERE b.user_id=? AND b.deleted=0 AND r.approved IS NOT NULL AND (r.yui=1 OR r.yumi=1) ORDER BY b.chat_id")?;
+        let rows = q
+            .query_map([&loco.expected_user_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rooms = Vec::new();
+        for (key, chat_id, name, epoch) in rows {
+            let [provider, account, room_id]: [String; 3] = serde_json::from_str(&key)?;
+            if provider == "kakao" && account == cfg.kakao.account {
+                if room_id.is_empty() || room_id.len() > crate::loco::MAX_ROOM_ID_BYTES {
+                    anyhow::bail!("invalid_loco_room_id")
+                }
+                rooms.push(json!({"room_id":room_id,"chat_id":chat_id,"name":name,"approval_epoch":epoch.to_string()}));
+            }
+        }
+        if rooms.len() > crate::loco::MAX_POLICY_ROOMS {
+            return Err(crate::loco::RoomLimitReached.into());
+        }
+        Ok(
+            json!({"status":"ready","user_id":loco.expected_user_id,"mode":loco.mode,"revision":revision.to_string(),"rooms":rooms}),
+        )
+    }
+    /// Selected SDK identity only; title is display metadata and never merges room identities.
+    pub fn add_loco_room(
+        &self,
+        cfg: &Config,
+        metadata: &Value,
+        yui: bool,
+        yumi: bool,
+    ) -> Result<Value> {
+        self.seed_loco(cfg)?;
+        let loco = cfg
+            .kakao
+            .loco
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("loco_not_configured"))?;
+        let chat_id = metadata["chat_id"]
+            .as_str()
+            .filter(|s| crate::loco::numeric_id(s))
+            .ok_or_else(|| anyhow::anyhow!("invalid_chat_id"))?;
+        let name = metadata["name"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty() && s.chars().count() <= 200)
+            .ok_or_else(|| anyhow::anyhow!("invalid_room_name"))?;
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let before = loco_counts(&tx)?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT conversation FROM loco_bindings WHERE user_id=? AND chat_id=?",
+                params![loco.expected_user_id, chat_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let c = Conversation {
+            provider: "kakao".into(),
+            account: cfg.kakao.account.clone(),
+            id: chat_id.to_owned(),
+        };
+        let key = existing.unwrap_or_else(|| c.key());
+        let foreign: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM loco_bindings WHERE conversation=? AND user_id<>?)",
+            params![key, loco.expected_user_id],
+            |r| r.get(0),
+        )?;
+        if foreign {
+            anyhow::bail!("loco_account_mismatch")
+        }
+        let [p, a, room_id]: [String; 3] = serde_json::from_str(&key)?;
+        if room_id.is_empty() || room_id.len() > crate::loco::MAX_ROOM_ID_BYTES {
+            anyhow::bail!("invalid_loco_room_id")
+        }
+        if p != "kakao" || a != cfg.kakao.account {
+            anyhow::bail!("loco_account_mismatch")
+        }
+        tx.execute("INSERT INTO rooms(conversation,title,approved,yui,yumi,seen,context_reset_at) VALUES(?1,?2,?3,?4,?5,?6,?3) ON CONFLICT(conversation) DO UPDATE SET title=excluded.title,approved=excluded.approved,yui=excluded.yui,yumi=excluded.yumi,context_reset_at=excluded.approved",params![key,name,now(),yui,yumi,now()])?;
+        tx.execute("INSERT INTO loco_bindings(conversation,user_id,chat_id,metadata) VALUES(?,?,?,?) ON CONFLICT(conversation) DO UPDATE SET metadata=excluded.metadata,deleted=0,epoch=epoch+1",params![key,loco.expected_user_id,chat_id,serde_json::to_string(metadata)?])?;
+        enforce_loco_growth(&tx, &before)?;
+        tx.commit()?;
+        Ok(
+            json!({"key":key,"chat_id":chat_id,"name":name,"approved":true,"yui":yui,"yumi":yumi,"transport":"loco"}),
+        )
     }
     /// Only the persisted in-flight lease can authorize a protocol component dispatch.
     pub fn sending_input(&self, key: &str) -> Result<Option<(Event, Plan, String)>> {
@@ -164,15 +339,30 @@ impl Store {
         ).optional()?)
     }
     pub fn note_room_seen(&self, c: &Conversation, title: &str) -> Result<()> {
-        let db = self.db()?;
+        let mut conn = self.db()?;
+        let db = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM loco_bindings WHERE conversation=? AND deleted=1)",
+            [c.key()],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Ok(());
+        }
         // A room the owner added by name binds to the real room ID on its first call.
-        if !title.is_empty() {
+        if !title.is_empty()
+            && !db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM loco_bindings WHERE conversation=?)",
+                [c.key()],
+                |r| r.get::<_, bool>(0),
+            )?
+        {
             db.execute(
                 "UPDATE rooms SET conversation=?1 WHERE conversation=?2 AND NOT EXISTS(SELECT 1 FROM rooms WHERE conversation=?1)",
                 params![c.key(), Self::named(c, title).key()],
             )?;
         }
         db.execute("INSERT INTO rooms(conversation,title,seen) VALUES(?,?,?) ON CONFLICT(conversation) DO UPDATE SET seen=excluded.seen",params![c.key(),title,now()])?;
+        db.commit()?;
         Ok(())
     }
     /// The registered room a window title names. The open-room watch sees only the title, so a title
@@ -247,7 +437,9 @@ impl Store {
             account: account.into(),
             id: String::new(),
         };
-        let db = self.db()?;
+        let mut connection = self.db()?;
+        let db = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let before = loco_counts(&db)?;
         // A room already known under its real ID is approved in place instead.
         let updated = db.execute(
             "UPDATE rooms SET approved=COALESCE(approved,?1),yui=?2,yumi=?3,verified_rows=?4,verified_at=?1 WHERE title=?5 AND conversation NOT LIKE '%\"name:%'",
@@ -259,6 +451,8 @@ impl Store {
                 params![Self::named(&template, title).key(), title, now(), yui, yumi, verified_rows],
             )?;
         }
+        enforce_loco_growth(&db, &before)?;
+        db.commit()?;
         Ok(())
     }
     /// Starts a room's conversation afresh: earlier exchanges are no longer passed to the sisters.
@@ -276,10 +470,29 @@ impl Store {
     }
     /// Approval, per-sister switches and an optional title correction from the dashboard.
     pub fn update_room(&self, key: &str, approved: bool, yui: bool, yumi: bool) -> Result<bool> {
-        Ok(self.db()?.execute(
+        let mut connection = self.db()?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if approved
+            && (yui || yumi)
+            && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM loco_bindings WHERE conversation=?)",
+                [key],
+                |r| r.get::<_, bool>(0),
+            )?
+        {
+            let [_, _, room_id]: [String; 3] = serde_json::from_str(key)?;
+            if room_id.is_empty() || room_id.len() > crate::loco::MAX_ROOM_ID_BYTES {
+                anyhow::bail!("invalid_loco_room_id")
+            }
+        }
+        let before = loco_counts(&tx)?;
+        let updated=tx.execute(
             "UPDATE rooms SET approved=CASE WHEN ?2 THEN COALESCE(approved,?5) ELSE NULL END,yui=?3,yumi=?4 WHERE conversation=?1",
             params![key, approved, yui, yumi, now()],
-        )? == 1)
+        )? == 1;
+        enforce_loco_growth(&tx, &before)?;
+        tx.commit()?;
+        Ok(updated)
     }
     /// The chat-list size at which this room's name was last proven unique.
     pub fn note_room_verified(&self, c: &Conversation, rows: i64) -> Result<()> {
@@ -307,6 +520,17 @@ impl Store {
             row["provider"] = json!(parts[0]);
             row["account"] = json!(parts[1]);
             row["conversation_id"] = json!(parts[2]);
+            let binding:Option<(String,String,String)>=db.query_row("SELECT chat_id,user_id,metadata FROM loco_bindings WHERE conversation=? AND deleted=0",[row["key"].as_str().unwrap()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+            if let Some((chat_id, user_id, metadata)) = binding {
+                row["chat_id"] = json!(chat_id);
+                row["transport"] = json!("loco");
+                row["user_id"] = json!(user_id);
+                let metadata: Value = serde_json::from_str(&metadata)?;
+                row["type"] = metadata["type"].clone();
+                row["member_count"] = metadata["member_count"].clone();
+            } else {
+                row["transport"] = json!("ax");
+            }
             items.push(row);
         }
         Ok(items)

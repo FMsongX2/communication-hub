@@ -116,12 +116,15 @@ pub struct LocoConfig {
 }
 impl LocoConfig {
     pub fn validate(&self) -> Result<()> {
+        if self.rooms.len() > crate::loco::MAX_POLICY_ROOMS {
+            return Err(crate::loco::RoomLimitReached.into());
+        }
         let mut ids = std::collections::HashSet::new();
         if !self.socket.is_absolute()
             || !crate::loco::numeric_id(&self.expected_user_id)
             || self.rooms.iter().any(|(room, id)| {
                 room.trim().is_empty()
-                    || room.len() > 512
+                    || room.len() > crate::loco::MAX_ROOM_ID_BYTES
                     || !crate::loco::numeric_id(id)
                     || !ids.insert(id)
             })
@@ -129,23 +132,6 @@ impl LocoConfig {
             bail!("invalid_loco_configuration")
         }
         Ok(())
-    }
-}
-impl KakaoConfig {
-    pub fn loco_target(
-        &self,
-        conversation: &crate::event::Conversation,
-    ) -> Option<(&LocoConfig, &str)> {
-        if conversation.provider != "kakao" || conversation.account != self.account {
-            return None;
-        }
-        let loco = self.loco.as_ref()?;
-        if loco.mode != LocoMode::Active {
-            return None;
-        }
-        loco.rooms
-            .get(&conversation.id)
-            .map(|id| (loco, id.as_str()))
     }
 }
 fn default_deferred_ttl() -> u64 {

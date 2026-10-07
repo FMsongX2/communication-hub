@@ -8,6 +8,88 @@ use tokio::{
     net::UnixStream,
 };
 
+/// The sidecar's policy schema bounds the complete effective allowlist.
+pub const MAX_POLICY_ROOMS: usize = 100;
+pub const MAX_ROOM_ID_BYTES: usize = 256;
+#[derive(Debug)]
+pub struct RoomLimitReached;
+impl std::fmt::Display for RoomLimitReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("room_limit_reached")
+    }
+}
+impl std::error::Error for RoomLimitReached {}
+pub fn room_limit_error(error: &anyhow::Error) -> bool {
+    error.is::<RoomLimitReached>()
+}
+/// SQLite is authoritative; static config participates only in the one-time migration.
+pub fn target(
+    cfg: &crate::config::Config,
+    store: &crate::store::Store,
+    c: &crate::event::Conversation,
+) -> Result<Option<(LocoConfig, String)>> {
+    let Some(mut loco) = cfg.kakao.loco.clone() else {
+        return Ok(None);
+    };
+    let Some(binding) = store.loco_binding(cfg, c)? else {
+        return Ok(None);
+    };
+    if loco.mode != LocoMode::Active
+        || binding["deleted"] == true
+        || store.room(c)?.is_none_or(|r| r["approved"] != true)
+    {
+        return Ok(None);
+    }
+    let chat_id = binding["chat_id"].as_str().unwrap().to_owned();
+    loco.rooms = std::collections::BTreeMap::from([(c.id.clone(), chat_id.clone())]);
+    Ok(Some((loco, chat_id)))
+}
+pub fn target_from_disk(
+    cfg: &crate::config::Config,
+    c: &crate::event::Conversation,
+) -> Result<Option<(LocoConfig, String)>> {
+    if cfg.kakao.loco.is_none() {
+        return Ok(None);
+    }
+    target(cfg, &crate::store::Store::open(cfg.state.clone())?, c)
+}
+pub fn managed(
+    cfg: &crate::config::Config,
+    store: &crate::store::Store,
+    c: &crate::event::Conversation,
+) -> Result<bool> {
+    let Some(loco) = &cfg.kakao.loco else {
+        return Ok(false);
+    };
+    if loco.mode != LocoMode::Active || c.provider != "kakao" || c.account != cfg.kakao.account {
+        return Ok(false);
+    }
+    store.seed_loco(cfg)?;
+    if store.db()?.query_row(
+        "SELECT EXISTS(SELECT 1 FROM loco_bindings WHERE conversation=?)",
+        [c.key()],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Ok(true);
+    }
+    // Native events carry the numeric chat ID even when an older binding used an alias.
+    let mut q = store.db()?;
+    let tx = q.transaction()?;
+    let mut rows = tx.prepare("SELECT conversation FROM loco_bindings WHERE chat_id=?")?;
+    let keys = rows
+        .query_map(rusqlite::params![c.id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for key in keys {
+        let [provider, account, _]: [String; 3] = serde_json::from_str(&key)?;
+        if provider == c.provider && account == c.account {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+pub async fn refresh(cfg: &LocoConfig) -> Result<Value> {
+    diagnostic(cfg, "refresh_policy").await
+}
 pub fn numeric_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 20
@@ -61,13 +143,16 @@ async fn exchange(mut stream: UnixStream, method: &str, params: Value) -> Result
 }
 pub async fn diagnostic(cfg: &LocoConfig, method: &str) -> Result<Value> {
     cfg.validate()?;
-    if !matches!(method, "status" | "list_rooms") {
+    if !matches!(method, "status" | "list_rooms" | "refresh_policy") {
         bail!("invalid_loco_diagnostic")
     }
-    let result = tokio::time::timeout(Duration::from_secs(10), async {
-        let stream = UnixStream::connect(&cfg.socket).await?;
-        exchange(stream, method, json!({})).await
-    })
+    let result = tokio::time::timeout(
+        Duration::from_secs(if method == "refresh_policy" { 5 } else { 30 }),
+        async {
+            let stream = UnixStream::connect(&cfg.socket).await?;
+            exchange(stream, method, json!({})).await
+        },
+    )
     .await??;
     if result["user_id"] != cfg.expected_user_id {
         bail!("loco_account_mismatch")

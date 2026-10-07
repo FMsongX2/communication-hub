@@ -696,6 +696,11 @@ fn original_pdf_is_exact_private_room_scoped_and_loco_only() {
             .contains("active_loco")
     );
     cfg.kakao.loco = Some(serde_json::from_value(json!({"socket":root.join("loco.sock"),"mode":"active","expected_user_id":"42","rooms":{"team":"100"}})).unwrap());
+    let store = Store::open(cfg.state.clone()).unwrap();
+    store.note_room_seen(&e.conversation, &e.title).unwrap();
+    store
+        .update_room(&e.conversation.key(), true, true, true)
+        .unwrap();
     let artifact = attachments::prepare(&cfg, &e, &e.key(), "approved").unwrap();
     let staged = Path::new(artifact["path"].as_str().unwrap());
     assert_eq!(fs::read(staged).unwrap(), pdf);

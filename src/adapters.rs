@@ -42,7 +42,7 @@ impl Adapter for Kakao {
         expressions::validate_plan(plan)?;
         let route = store.route(&e.conversation)?;
         let name = route.as_deref().unwrap_or(&e.title);
-        if name.is_empty() && self.cfg.kakao.loco_target(&e.conversation).is_none() {
+        if name.is_empty() && crate::loco::target(&self.cfg, store, &e.conversation)?.is_none() {
             return Ok(json!({"status":"held","reason":"missing_target"}));
         }
         let deferred_deadline = store.deferred_deadline(key)?;
@@ -91,7 +91,7 @@ impl Adapter for Kakao {
             p["attachment_path"] = artifact["path"].clone();
             p["attachment_sha256"] = artifact["sha256"].clone();
         }
-        if self.cfg.kakao.loco_target(&e.conversation).is_some() {
+        if crate::loco::managed(&self.cfg, store, &e.conversation)? {
             let mut result = self.authorized_loco_send(store, key, e, &p).await?;
             // Protocol failures never become deferred UI retries.
             result["defer_locked_delivery"] = json!(false);
@@ -148,8 +148,17 @@ fn note_list_size(store: &Store, e: &Event, receipt: &Value) -> Result<()> {
 impl Kakao {
     /// Readiness for the exact event route; a mapped protocol room never probes UI state.
     pub async fn event_session_state(&self, e: &Event) -> Result<Value> {
-        if let Some((loco, _)) = self.cfg.kakao.loco_target(&e.conversation) {
-            return crate::loco::diagnostic(loco, "status").await;
+        if let Some((loco, _)) = crate::loco::target_from_disk(&self.cfg, &e.conversation)? {
+            return crate::loco::diagnostic(&loco, "status").await;
+        }
+        if self.cfg.kakao.loco.is_some()
+            && crate::loco::managed(
+                &self.cfg,
+                &Store::open(self.cfg.state.clone())?,
+                &e.conversation,
+            )?
+        {
+            return Ok(crate::loco::held("loco_mapping_revoked"));
         }
         self.session_state().await
     }
@@ -172,15 +181,14 @@ impl Kakao {
         {
             return Ok(crate::loco::held("delivery_paused"));
         }
-        let (loco, chat_id) = self
-            .cfg
-            .kakao
-            .loco_target(&e.conversation)
-            .ok_or_else(|| anyhow::anyhow!("loco_mapping_missing"))?;
+        let Some((loco, chat_id)) = crate::loco::target(&self.cfg, store, &e.conversation)? else {
+            return Ok(crate::loco::held("loco_mapping_revoked"));
+        };
+        let binding = store.loco_binding(&self.cfg, &e.conversation)?.unwrap();
         let params = json!({"delivery_id":key,"expected_user_id":loco.expected_user_id,
-            "chat_id":chat_id,"reply":p["reply"],"attachment_path":p["attachment_path"],
+            "chat_id":chat_id,"approval_epoch":binding["approval_epoch"],"reply":p["reply"],"attachment_path":p["attachment_path"],
             "attachment_sha256":p["attachment_sha256"],"expires_at":p["expires_at"]});
-        Ok(crate::loco::send(loco, params).await)
+        Ok(crate::loco::send(&loco, params).await)
     }
     /// Read-only session state; does not activate Kakao, write a draft, paste, or send.
     pub async fn session_state(&self) -> Result<Value> {
@@ -190,11 +198,14 @@ impl Kakao {
     /// Runs the sender's full target verification without writing anything, so the scan of the
     /// chat list overlaps model inference and the following send reuses its fresh result.
     pub async fn prewarm(&self, store: &Store, e: &Event) -> Result<Value> {
-        if let Some((loco, _)) = self.cfg.kakao.loco_target(&e.conversation) {
+        if let Some((loco, _)) = crate::loco::target(&self.cfg, store, &e.conversation)? {
             if let Some(reason) = native_gate(&self.cfg, store, e, false)? {
                 return Ok(crate::loco::held(&reason));
             }
-            return crate::loco::diagnostic(loco, "status").await;
+            return crate::loco::diagnostic(&loco, "status").await;
+        }
+        if crate::loco::managed(&self.cfg, store, &e.conversation)? {
+            return Ok(crate::loco::held("loco_mapping_revoked"));
         }
         let route = store.route(&e.conversation)?;
         let name = route.as_deref().unwrap_or(&e.title);
@@ -226,6 +237,27 @@ impl Kakao {
     /// Reads the chat list's room names for the dashboard picker; names shared by several rooms
     /// are flagged because they cannot be addressed safely.
     pub async fn list_rooms(&self, store: &Store) -> Result<Value> {
+        if let Some(loco) = &self.cfg.kakao.loco {
+            store.seed_loco(&self.cfg)?;
+            let mut catalog = crate::loco::diagnostic(loco, "list_rooms").await?;
+            catalog["transport"] = json!("loco");
+            let registered = store.rooms()?;
+            if let Some(rooms) = catalog["rooms"].as_array_mut() {
+                for room in rooms {
+                    let found = registered.iter().find(|r| {
+                        r["chat_id"] == room["chat_id"]
+                            && r["user_id"] == loco.expected_user_id
+                            && r["account"] == self.cfg.kakao.account
+                    });
+                    room["registered"] = json!(found.is_some());
+                    room["transport"] = json!("loco");
+                    for field in ["approved", "yui", "yumi", "key"] {
+                        room[field] = found.map(|r| r[field].clone()).unwrap_or(Value::Null);
+                    }
+                }
+            }
+            return Ok(catalog);
+        }
         let receipt = self
             .native_request(&json!({"chat_name":"room-list","trigger_body":"room-list",
                 "reply":crate::event::PREFIX,"list_rooms":true,"expires_at":crate::event::now()+75.0}))
@@ -260,7 +292,9 @@ impl Kakao {
                 |n| json!({"name":n,"duplicate":counts[&n]>1,"registered":registered.contains(&n)}),
             )
             .collect();
-        Ok(json!({"status":"ready","rooms":rooms,"list_rows":receipt["list_rows"]}))
+        Ok(
+            json!({"status":"ready","transport":"ax","rooms":rooms,"list_rows":receipt["list_rows"]}),
+        )
     }
     /// Dashboard registration: proves the room name is unique in the chat list without opening the
     /// room or writing anything, and records the list size it held at.
@@ -270,6 +304,22 @@ impl Kakao {
             .into_iter()
             .find(|r| r["key"] == key)
             .ok_or_else(|| anyhow::anyhow!("unknown_room"))?;
+        if room["transport"] == "loco" {
+            let loco = self
+                .cfg
+                .kakao
+                .loco
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("loco_not_configured"))?;
+            let catalog = crate::loco::diagnostic(loco, "list_rooms").await?;
+            let found = catalog["status"] == "ready"
+                && catalog["rooms"]
+                    .as_array()
+                    .is_some_and(|rs| rs.iter().any(|r| r["chat_id"] == room["chat_id"]));
+            return Ok(
+                json!({"status":if found {"ready"}else{"held"},"transport":"loco","chat_id":room["chat_id"],"reason":if found {Value::Null}else{json!("room_not_in_catalog")}}),
+            );
+        }
         let receipt = self
             .verify_name(room["title"].as_str().unwrap_or(""))
             .await?;

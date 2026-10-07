@@ -162,11 +162,49 @@ async fn calls(
         .map(Json)
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
+fn sync_state(b: &Board) -> Result<Value> {
+    if b.cfg.kakao.loco.is_none() {
+        return Ok(json!({"transport":"ax","sync_status":"ready"}));
+    }
+    let policy = b.store.loco_policy(&b.cfg)?;
+    let path = b.cfg.state.join("loco-policy-sync.json");
+    let ack = json_file(&path)?;
+    Ok(
+        json!({"transport":"loco","revision":policy["revision"],"sync_status":if ack["revision"]==policy["revision"] && ack["user_id"]==policy["user_id"] && ack["status"]=="ready" {"ready"}else{"pending"}}),
+    )
+}
+async fn synchronize(b: &Board) -> Value {
+    if let Some(loco) = &b.cfg.kakao.loco {
+        let response = crate::loco::refresh(loco).await;
+        let mut ack = match response {
+            Ok(v) => v,
+            Err(_) => json!({"status":"pending","user_id":loco.expected_user_id}),
+        };
+        if !ack["rooms"]
+            .as_array()
+            .is_some_and(|rooms| rooms.iter().all(|r| r["status"] == "ready"))
+        {
+            ack["status"] = json!("pending");
+        }
+        let _ = atomic(&b.cfg.state.join("loco-policy-sync.json"), &ack);
+    }
+    sync_state(b).unwrap_or_else(|_| json!({"transport":"loco","sync_status":"pending"}))
+}
+fn with_sync(mut value: Value, sync: Value) -> Value {
+    if let (Some(v), Some(s)) = (value.as_object_mut(), sync.as_object()) {
+        v.extend(s.clone());
+    }
+    value
+}
 async fn rooms(State(b): State<Board>) -> Result<Json<Value>, StatusCode> {
     let fail = |_| StatusCode::SERVICE_UNAVAILABLE;
-    Ok(Json(json!({"rooms":b.store.rooms().map_err(fail)?,
+    b.store.seed_loco(&b.cfg).map_err(fail)?;
+    Ok(Json(with_sync(
+        json!({"rooms":b.store.rooms().map_err(fail)?,
         "answer_unapproved_rooms":b.store.answer_unapproved_rooms().map_err(fail)?,
-        "yumi_configured":b.cfg.yumi.is_some()})))
+        "yumi_configured":b.cfg.yumi.is_some()}),
+        synchronize(&b).await,
+    )))
 }
 #[derive(Deserialize)]
 pub struct RoomUpdate {
@@ -179,9 +217,41 @@ async fn update_room(
     State(b): State<Board>,
     Json(u): Json<RoomUpdate>,
 ) -> Result<Json<Value>, StatusCode> {
+    b.store
+        .seed_loco(&b.cfg)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    if u.approved
+        && let Some(loco) = &b.cfg.kakao.loco
+    {
+        let registered = b
+            .store
+            .rooms()
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        if let Some(room) = registered
+            .iter()
+            .find(|r| r["key"] == u.key && r["transport"] == "loco")
+        {
+            let catalog = crate::loco::diagnostic(loco, "list_rooms")
+                .await
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            if catalog["status"] != "ready"
+                || !catalog["rooms"]
+                    .as_array()
+                    .is_some_and(|rs| rs.iter().any(|r| r["chat_id"] == room["chat_id"]))
+            {
+                return Err(StatusCode::CONFLICT);
+            }
+        }
+    }
     match b.store.update_room(&u.key, u.approved, u.yui, u.yumi) {
-        Ok(true) => Ok(Json(json!({"updated":true}))),
+        Ok(true) => Ok(Json(with_sync(
+            json!({"updated":true}),
+            synchronize(&b).await,
+        ))),
         Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) if crate::loco::room_limit_error(&error) => Ok(Json(
+            json!({"updated":false,"status":"held","reason":"room_limit_reached","limit":crate::loco::MAX_POLICY_ROOMS}),
+        )),
         Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
 }
@@ -205,17 +275,20 @@ async fn verify_room(
 }
 /// The chat list's room names, read through the sender on the owner's request only.
 async fn available_rooms(State(b): State<Board>) -> Result<Json<Value>, StatusCode> {
-    crate::adapters::Kakao {
+    let result = crate::adapters::Kakao {
         cfg: (*b.cfg).clone(),
     }
     .list_rooms(&b.store)
     .await
-    .map(Json)
-    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    Ok(Json(with_sync(result, synchronize(&b).await)))
 }
 #[derive(Deserialize)]
 pub struct RoomAdd {
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
+    pub chat_id: Option<String>,
     pub yui: bool,
     pub yumi: bool,
 }
@@ -224,6 +297,46 @@ async fn add_room(
     State(b): State<Board>,
     Json(a): Json<RoomAdd>,
 ) -> Result<Json<Value>, StatusCode> {
+    if let Some(loco) = &b.cfg.kakao.loco {
+        let chat_id = a
+            .chat_id
+            .as_deref()
+            .filter(|s| crate::loco::numeric_id(s))
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        let catalog = crate::loco::diagnostic(loco, "list_rooms")
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        if catalog["status"] != "ready" {
+            return Ok(Json(
+                json!({"added":false,"status":catalog["status"],"reason":catalog["reason"]}),
+            ));
+        }
+        let matches: Vec<&Value> = catalog["rooms"]
+            .as_array()
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+            .iter()
+            .filter(|r| r["chat_id"] == chat_id)
+            .collect();
+        let [metadata] = matches.as_slice() else {
+            return Err(StatusCode::BAD_REQUEST);
+        };
+        let room = match b.store.add_loco_room(&b.cfg, metadata, a.yui, a.yumi) {
+            Ok(room) => room,
+            Err(error) if crate::loco::room_limit_error(&error) => {
+                return Ok(Json(
+                    json!({"added":false,"status":"held","reason":"room_limit_reached","limit":crate::loco::MAX_POLICY_ROOMS}),
+                ));
+            }
+            Err(_) => return Err(StatusCode::BAD_REQUEST),
+        };
+        return Ok(Json(with_sync(
+            json!({"added":true,"room":room}),
+            synchronize(&b).await,
+        )));
+    }
+    if a.chat_id.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let receipt = crate::adapters::Kakao {
         cfg: (*b.cfg).clone(),
     }
@@ -249,7 +362,10 @@ async fn reset_context(
     Json(r): Json<RoomKey>,
 ) -> Result<Json<Value>, StatusCode> {
     match b.store.reset_room_context(&r.key) {
-        Ok(true) => Ok(Json(json!({"reset":true}))),
+        Ok(true) => Ok(Json(with_sync(
+            json!({"reset":true}),
+            synchronize(&b).await,
+        ))),
         Ok(false) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
@@ -259,7 +375,10 @@ async fn remove_room(
     Json(r): Json<RoomKey>,
 ) -> Result<Json<Value>, StatusCode> {
     match b.store.remove_room(&r.key) {
-        Ok(true) => Ok(Json(json!({"removed":true}))),
+        Ok(true) => Ok(Json(with_sync(
+            json!({"removed":true}),
+            synchronize(&b).await,
+        ))),
         Ok(false) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
     }

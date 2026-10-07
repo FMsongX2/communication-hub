@@ -83,6 +83,7 @@ pub async fn run(cfg: Config, no_receiver: bool) -> Result<()> {
     let listener = UnixListener::bind(&cfg.socket)?;
     std::fs::set_permissions(&cfg.socket, std::fs::Permissions::from_mode(0o600))?;
     let mut store = Store::open(cfg.state.clone())?;
+    store.seed_loco(&cfg)?;
     store.store_bodies = cfg.dashboard.as_ref().is_some_and(|d| d.store_body);
     store.import_legacy(&cfg)?;
     store.recover()?;
@@ -368,6 +369,7 @@ fn handle(
             notify.notify_one();
             Ok(json!({"resumed":true}))
         }
+        Some("loco_room_policy") => store.loco_policy(cfg),
         Some("authorize_kakao_loco") => {
             authorize_loco(cfg, store, &v["params"], sending.load(Ordering::SeqCst))
         }
@@ -441,7 +443,7 @@ fn ingest(
     if protocol != (event.source == crate::event::LOCO_SOURCE) {
         return Err(Rejected.into());
     }
-    if !protocol && cfg.kakao.loco_target(&event.conversation).is_some() {
+    if !protocol && crate::loco::managed(cfg, store, &event.conversation)? {
         return Ok(json!({"status":"ignored","reason":"loco_owns_room"}));
     }
     cfg.validate_channel(&event.conversation.provider, &event.conversation.account)
@@ -547,9 +549,14 @@ pub fn authorize_loco(cfg: &Config, store: &Store, params: &Value, sending: bool
     let Some((event, plan, phase)) = store.sending_input(key)? else {
         return held("delivery_not_sending");
     };
-    let Some((loco, chat_id)) = cfg.kakao.loco_target(&event.conversation) else {
+    let Some((loco, chat_id)) = crate::loco::target(cfg, store, &event.conversation)? else {
         return held("loco_binding_not_active");
     };
+    if params["approval_epoch"]
+        != store.loco_binding(cfg, &event.conversation)?.unwrap()["approval_epoch"]
+    {
+        return held("loco_approval_epoch_changed");
+    }
     if loco.validate().is_err()
         || params["user_id"] != loco.expected_user_id
         || params["chat_id"] != chat_id
@@ -607,9 +614,19 @@ pub fn ingest_loco(
     let Some(chat_id) = raw["chat_id"].as_str().filter(|s| numeric_id(s)) else {
         return rejected("loco_invalid_chat_id");
     };
-    let Some((room_id, _)) = loco.rooms.iter().find(|(_, id)| *id == chat_id) else {
+    let policy = store.loco_policy(cfg)?;
+    let Some(binding) = policy["rooms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["chat_id"] == chat_id)
+    else {
         return rejected("loco_unmapped_chat");
     };
+    if raw["approval_epoch"] != binding["approval_epoch"] {
+        return rejected("loco_approval_epoch_changed");
+    }
+    let room_id = binding["room_id"].as_str().unwrap();
     let Some(log_id) = raw["log_id"].as_str().filter(|s| numeric_id(s)) else {
         return rejected("loco_invalid_log_id");
     };
@@ -625,7 +642,7 @@ pub fn ingest_loco(
     let conversation = Conversation {
         provider: "kakao".into(),
         account: cfg.kakao.account.clone(),
-        id: room_id.clone(),
+        id: room_id.to_owned(),
     };
     // Requiring an existing binding prevents the legacy title-matching registration path from
     // implicitly approving a protocol room.
@@ -655,7 +672,7 @@ pub fn ingest_loco(
         agent: Agent::Yui,
         metadata: json!({"transport":"loco","user_id":loco.expected_user_id,"chat_id":chat_id,
             "author_id":author_id,"log_id":log_id,"sender_identity":"protocol_authenticated",
-            "actual_mention_verified":false}),
+            "actual_mention_verified":false,"approval_epoch":binding["approval_epoch"]}),
     };
     let mut result = if loco.mode == LocoMode::Shadow {
         json!({"status":"shadow"})
@@ -697,6 +714,55 @@ mod loco_ingress_tests {
                 .query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+    }
+    #[test]
+    fn dynamic_room_sdk_and_native_first_call_share_identity_and_revoked_native_stays_suppressed() {
+        let t = tempfile::TempDir::new().unwrap();
+        let p = t.path();
+        let cfg:Config=serde_json::from_value(json!({"state":p.join("state"),"socket":p.join("hub.sock"),"app_server_socket":p.join("app.sock"),"contact_skill":p.join("policy.md"),"lookup_workdir":p,"external_auto_send":false,"kakao":{"enabled":true,"account":"owner","legacy_state":p.join("legacy"),"receiver_app":p.join("receiver"),"sender_app":p.join("sender"),"sender_ipc":p.join("ipc"),"loco":{"socket":p.join("loco.sock"),"expected_user_id":"123","mode":"active","rooms":{}}}})).unwrap();
+        let store = Store::open(cfg.state.clone()).unwrap();
+        let added = store
+            .add_loco_room(
+                &cfg,
+                &json!({"chat_id":"456","name":"same","type":"MultiChat","member_count":3}),
+                true,
+                false,
+            )
+            .unwrap();
+        let mut e:Event=serde_json::from_value(json!({"conversation":{"provider":"kakao","account":"owner","id":"456"},"id":"native","body":"@[유이] task","title":"same","occurred_at":now(),"source":"kakao_notification_store"})).unwrap();
+        assert_eq!(e.conversation.key(), added["key"]);
+        let epoch =
+            store.loco_binding(&cfg, &e.conversation).unwrap().unwrap()["approval_epoch"].clone();
+        for source in [
+            crate::event::NOTIFICATION_SOURCE,
+            crate::event::OPEN_ROOM_SOURCE,
+        ] {
+            e.source = source.into();
+            assert_eq!(
+                ingest(&cfg, &store, e.clone(), &Notify::new(), false, false).unwrap()["reason"],
+                "loco_owns_room"
+            );
+        }
+        let sdk = json!({"mode":"active","user_id":"123","chat_id":"456","log_id":"789","author_id":"222","body":e.body,"sent_at":now(),"title":"same","approval_epoch":epoch});
+        assert_eq!(
+            ingest_loco(&cfg, &store, &sdk, &Notify::new(), false).unwrap()["status"],
+            "queued"
+        );
+        store.remove_room(&e.conversation.key()).unwrap();
+        assert_eq!(
+            ingest(&cfg, &store, e.clone(), &Notify::new(), false, false).unwrap()["reason"],
+            "loco_owns_room"
+        );
+        store.note_room_seen(&e.conversation, "same").unwrap();
+        assert!(store.room(&e.conversation).unwrap().is_none());
+        assert_eq!(
+            store
+                .db()
+                .unwrap()
+                .query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 }

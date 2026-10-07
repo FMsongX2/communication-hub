@@ -125,9 +125,15 @@ pub fn authorization_stamp(cfg: &Config, e: &Event) -> Result<String> {
     let mut stamp = json!({"version":1,"conversation":e.conversation,"agent":e.agent,
         "policy":policy_hash,"persona":persona_hash,"project_bindings":ids,"project_definitions":definitions,
         "approved_bundles":attachments::bundles(cfg,e)?});
-    if let Some((loco, chat_id)) = cfg.kakao.loco_target(&e.conversation) {
+    if let Some((loco, chat_id)) = crate::loco::target_from_disk(cfg, &e.conversation)? {
         stamp["transport_binding"] =
             json!({"transport":"loco","user_id":loco.expected_user_id,"chat_id":chat_id});
+    }
+    if cfg.kakao.loco.is_some() {
+        let store = crate::store::Store::open(cfg.state.clone())?;
+        if let Some(binding) = store.loco_binding(cfg, &e.conversation)? {
+            stamp["binding_policy"] = binding;
+        }
     }
     Ok(digest(serde_json::to_vec(&stamp)?))
 }
@@ -148,8 +154,26 @@ pub fn delivery_gate(
     let Some(room) = store.room(&e.conversation)? else {
         return Ok(Some("room_revoked"));
     };
-    if room["approved"] != true && !store.answer_unapproved_rooms()? {
+    if room["approved"] != true
+        && (store.loco_binding(cfg, &e.conversation)?.is_some()
+            || !store.answer_unapproved_rooms()?)
+    {
         return Ok(Some("room_revoked"));
+    }
+    if crate::loco::managed(cfg, store, &e.conversation)?
+        && crate::loco::target(cfg, store, &e.conversation)?.is_none()
+    {
+        return Ok(Some("loco_binding_revoked"));
+    }
+    if let Some(binding) = store.loco_binding(cfg, &e.conversation)? {
+        if binding["deleted"] == true {
+            return Ok(Some("room_revoked"));
+        }
+        if e.source == crate::event::LOCO_SOURCE
+            && e.metadata["approval_epoch"] != binding["approval_epoch"]
+        {
+            return Ok(Some("approval_epoch_changed"));
+        }
     }
     if room[e.agent.name_key()] != true {
         return Ok(Some("sister_disabled"));

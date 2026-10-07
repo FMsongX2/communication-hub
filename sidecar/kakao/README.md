@@ -33,7 +33,7 @@ actual screen-lock or tablet/desktop coexistence has not been tested.
 ## IPC and delivery
 
 One JSONL request per connection, maximum 128 KiB, up to 32 simultaneous connections.
-Requests: `{id:string,method:'status'|'list_rooms'|'send',params:{...}}`.
+Requests: `{id:string,method:'status'|'list_rooms'|'list_chats'|'resolve_chat'|'refresh_policy'|'room_info'|'message_page'|'send',params:{...}}`.
 Responses: `{id,ok:true,result}` or `{id,ok:false,error:{code}}`.
 `send` takes `delivery_id`, `expected_user_id`, `chat_id`, `reply`, Unix-seconds
 `expires_at`, and optional `attachment_path`/`attachment_sha256` (null accepted).
@@ -84,8 +84,64 @@ Ordinary disconnects use 1–30 second bounded exponential backoff and the same 
 Hub failure retries from the durable cursor. KICKOUT is terminal and cannot reclaim
 the account automatically. Invalid/expired token becomes `auth_required`, requiring
 explicit owner reauthentication. No refresh-token extraction or automatic refresh
-is implemented. The 5-second reconciliation timer is a fallback for missed pushes;
-normal pushes request reconciliation after 50 ms.
+is implemented. Remote history anti-entropy runs every 30 seconds by default;
+normal pushes request reconciliation after 50 ms and query only dirty approved rooms.
+
+## Dynamic room policy and GUI catalog
+
+Set optional `dynamic_room_policy: true` only with a Hub that implements the
+contracts below. The default remains static-config compatibility. In dynamic mode,
+`allowed_chat_ids` is never a fallback: the Hub's durable SQLite approvals are the
+only room authority. The original config IDs are retained solely for the bounded
+one-time cursor adoption described below.
+
+The sidecar pulls `{method:"loco_room_policy",params:{user_id}}` at startup, on
+`refresh_policy`, before diagnostic room reads, and every five seconds over the
+local Unix socket. This is a local policy request, not a remote room/catalog scan.
+The Hub response is `{ok:true,result:{status:"ready",user_id,mode,revision,rooms}}`;
+`revision` is a string and each approved room is
+`{room_id,chat_id,name,approval_epoch}` with a durable string `approval_epoch`.
+User ID and mode must exactly match the sidecar; duplicate room/chat IDs, malformed
+snapshots, and unreachable Hub fail closed. A temporary outage clears active
+permissions and cancels pending room work without erasing durable cursors. A later
+valid policy restores access; revoked config rooms cannot be resurrected.
+
+`refresh_policy` accepts only empty params and returns
+`{status:"ready",user_id,revision,rooms:[{chat_id,status,reason?}]}`. Its top-level
+status means the policy was applied; per-room status distinguishes `sync_pending`,
+`ready`, and `held`. Adding a room starts a read-only watermark/bootstrap without
+restarting the SDK session. Removing a room clears dirty/pending/issue state and
+cancels its sync waiter. After every asynchronous page, watermark, or Hub ACK,
+the receiver verifies the current runtime scope before ingestion or cursor advance.
+A failure in one room does not prevent other approved rooms from being ready.
+
+`approval_epoch` changes when the Hub deletes/re-adds or changes a binding. The
+sidecar persists each epoch beside its cursor; an epoch change discards that receive
+cursor and starts at a new watermark. Calls from the unapproved interval and calls
+at/before the initial dynamic watermark are not replayed. An unchanged epoch across
+restart preserves the cursor and backfills approved downtime. The first valid
+policy migration may adopt an existing static cursor only when there is no persisted
+dynamic-initialization marker, the room was in the original static allowlist, the
+current Hub snapshot approves it, and its epoch is `"1"`. The marker is durable and
+is not set on policy failure. All other newly approved or changed rooms bootstrap.
+Completed/uncertain delivery and outgoing-receipt journals are never erased.
+
+Dynamic `send` requests must include the current `approval_epoch`. The sender also
+captures a runtime scope before entering its queue and rechecks it after session
+and host-authorization awaits, and between text and attachment components. Ingest
+and `authorize_kakao_loco` payloads include `approval_epoch`; the Hub must validate
+it against durable current policy before dispatch so an already in-flight IPC
+request cannot cross a revocation/re-add boundary. A stale queued request is held.
+
+`list_rooms` and `list_chats` are aliases returning
+`{status:"ready",user_id,rooms:[{chat_id,name,type,member_count}]}` from a fresh,
+complete canonical `getChats({all:true,resolveTitles:true})` scan. Duplicate display
+names remain distinct by chat ID. These responses include no messages, previews,
+last-message fields, or member profile data. `resolve_chat({chat_id})` rescans that
+same authenticated account catalog and returns only the selected room's metadata;
+unknown/stale IDs fail. Catalog operations never enter rooms, send messages, grant
+access, or invoke models. Existing `room_info`/`message_page` diagnostics still
+require current approval and discard results if revoked while awaiting the SDK.
 
 ## Validation boundary
 

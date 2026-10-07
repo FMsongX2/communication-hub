@@ -9,6 +9,7 @@ import { accountLock } from './lock';
 import { Store } from './store';
 import { Sender } from './send';
 import { Receiver } from './receive';
+import { RoomPolicy } from './policy';
 import { hubRequest, hubCall, serve } from './ipc';
 
 export interface Listener {
@@ -35,6 +36,8 @@ export async function startSidecar(input: Config, deps: Dependencies = {}) {
   process.umask(0o077);
   const config = ConfigSchema.parse(input);
   const antiEntropyMs = antiEntropyInterval();
+  const initialStaticIds=new Set(config.allowed_chat_ids);
+  if(config.dynamic_room_policy)config.allowed_chat_ids=[];
   const approved = new Set(config.allowed_chat_ids);
   const dirty = new Set<string>();
   const unlock = (deps.lock ?? accountLock)(config.expected_user_id);
@@ -42,6 +45,10 @@ export async function startSidecar(input: Config, deps: Dependencies = {}) {
   let loopRunning = false, backoff = 1000, fullRequested = true, metadataRequested = true;
   let nextFullAt = Date.now() + antiEntropyMs, timerAt = Infinity;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let policyTimer: ReturnType<typeof setInterval> | undefined;
+  let policy: RoomPolicy | undefined;
+  let wake=()=>{};
+  let bootstrapping=true;
   let client: Client | undefined, listener: Listener | undefined, store: Store | undefined;
   let server: Awaited<ReturnType<typeof serve>> | undefined;
   const close = () => {
@@ -50,6 +57,8 @@ export async function startSidecar(input: Config, deps: Dependencies = {}) {
     process.off('SIGINT', close);
     process.off('SIGTERM', close);
     if (timer) clearTimeout(timer);
+    if(policyTimer)clearInterval(policyTimer);
+    policy?.close();
     listener?.stop();
     client?.close();
     server?.close();
@@ -78,23 +87,41 @@ export async function startSidecar(input: Config, deps: Dependencies = {}) {
     if (closed) { client.close(); throw new Error('sidecar_stopped'); }
     store = new Store(config.state_dir, config.expected_user_id);
     const receiver = new Receiver(config, client, store, event => hubRequest(config.hub_socket, event));
+    if(config.dynamic_room_policy) {
+      policy=new RoomPolicy(config,receiver,approved,(added,healthy)=>{
+        for(const chat of dirty)if(!approved.has(chat))dirty.delete(chat);
+        if(!healthy){ready=false;reason='policy_unavailable';}
+        for(const chat of added)dirty.add(chat);
+        if(added.length||!ready)wake();
+      },initialStaticIds);
+    }
     const sender = new Sender(config, client, store, () => ready && !terminal && !closed, async params => {
       const ack = await hubCall(config.hub_socket, { method: 'authorize_kakao_loco', params });
       return ack?.ok === true && ack.result?.status === 'authorized';
-    });
+    },chat=>!config.dynamic_room_policy?receiver.scope(chat):policy?.healthy&&receiver.roomReady(chat)?receiver.scope(chat):null,chat=>receiver.approvalEpoch(chat));
     const status = () => ({ status: ready ? 'ready' : 'held', reason: ready ? undefined : reason,
       user_id: config.expected_user_id, connected: client!.isConnected(), mode: config.mode,
-      receive_issues: Object.fromEntries(receiver.issues) });
+      receive_issues: Object.fromEntries(receiver.issues),
+      ...(policy?{policy_revision:policy.revision,policy_status:policy.healthy?'ready':'unavailable',rooms:[...approved].map(chat_id=>({chat_id,status:receiver.roomReady(chat_id)?'ready':receiver.issues.has(chat_id)?'held':'sync_pending',reason:receiver.issues.get(chat_id)}))}:{}) });
     server = await serve(config.socket_path, async (method, params) => {
       if (method === 'status') return status();
       if (method === 'send') return sender.send(params);
+      if(method==='refresh_policy') {
+        z.object({}).strict().parse(params);
+        if(!policy)throw new Error('dynamic_policy_disabled');
+        await policy.refresh();
+        return {status:'ready',user_id:config.expected_user_id,revision:policy.revision,rooms:status().rooms};
+      }
       if (method === 'room_info' || method === 'message_page') {
         const id = z.string().refine(positiveId);
         const roomSchema = z.object({chat_id:id}).strict();
         const pageSchema = z.object({chat_id:id,from:z.string().refine(v=>v==='0'||positiveId(v)),
           count:z.number().int().min(1).max(20)}).strict();
         const request = method === 'room_info' ? roomSchema.parse(params) : pageSchema.parse(params);
-        if (!approved.has(request.chat_id)) throw new Error('room_not_approved');
+        if(policy)await policy.refresh();
+        const scope=receiver.scope(request.chat_id);
+        const assertApproved=()=>{if(!scope||receiver.scope(request.chat_id)!==scope||!approved.has(request.chat_id)||policy&&!policy.healthy)throw new Error('room_not_approved');};
+        assertApproved();
         if (terminal || closed || !client!.isConnected()) throw new Error('transport_not_ready');
         if (client!.getCredentials().userId !== config.expected_user_id) throw new Error('wrong_account');
         if (method === 'room_info') {
@@ -102,11 +129,13 @@ export async function startSidecar(input: Config, deps: Dependencies = {}) {
           let chat, members;
           try {
             chat = await client!.getChat(request.chat_id);
+            assertApproved();
             members = await client!.getMemberSnapshot(request.chat_id);
           } catch (error:any) {
             const codes = ['get_chat_failed','get_member_snapshot_failed','invalid_access_token','login_rejected','not_authenticated','client_closed'];
             return {status:'held',reason:'room_info_failed',error_code:codes.includes(error?.code)?error.code:'sdk_read_failed'};
           }
+          assertApproved();
           const memberIds = members.members.map(member=>member.user_id);
           if (chat.chat_id !== request.chat_id || members.chat_id !== request.chat_id || members.complete !== true
             || chat.active_members !== members.active_members || memberIds.length !== members.active_members
@@ -116,17 +145,35 @@ export async function startSidecar(input: Config, deps: Dependencies = {}) {
         }
         const pageRequest = pageSchema.parse(params);
         const page = await client!.getMessagePage(pageRequest.chat_id,{from:pageRequest.from,count:pageRequest.count});
+        assertApproved();
         if (page.messages.length > pageRequest.count) throw new Error('invalid_message_page');
         const messages = page.messages.map(({log_id,author_id,message,sent_at,type,attachment})=>({log_id,author_id,message,sent_at,type,attachment}));
         const result = {status:'ready',chat_id:pageRequest.chat_id,messages,next_cursor:page.next_cursor,complete:page.complete};
         if (Buffer.byteLength(JSON.stringify(result)) > MAX_FRAME - 256) throw new Error('diagnostic_frame_limit');
         return result;
       }
-      if (method === 'list_rooms') {
-        if (terminal || !client!.isConnected()) return status();
-        const rooms = await client!.getChats({ all: true, resolveTitles: true });
-        for (const room of rooms) receiver.setTitle(room.chat_id, room.title ?? room.display_name ?? room.chat_id);
-        return { status: 'ready', user_id: config.expected_user_id, rooms };
+      if (method === 'list_rooms' || method === 'list_chats' || method === 'resolve_chat') {
+        const request=method==='resolve_chat'?z.object({chat_id:z.string().refine(positiveId)}).strict().parse(params):z.object({}).strict().parse(params);
+        if (terminal || closed || !client!.isConnected()) throw new Error('transport_not_ready');
+        if(client!.getCredentials().userId!==config.expected_user_id)throw new Error('wrong_account');
+        const catalog = await client!.getChats({ all: true, resolveTitles: true });
+        if(terminal||closed||client!.getCredentials().userId!==config.expected_user_id)throw new Error('transport_not_ready');
+        const ids=new Set<string>();
+        const rooms=catalog.map(room=>{
+          if(!positiveId(room.chat_id)||ids.has(room.chat_id)||typeof room.type!=='string'&&typeof room.type!=='number'||!Number.isSafeInteger(room.active_members)||room.active_members!<0)throw new Error('invalid_catalog');
+          ids.add(room.chat_id);
+          const name=room.title??room.display_name??room.chat_id;
+          receiver.setTitle(room.chat_id,name);
+          return {chat_id:room.chat_id,name,type:room.type,member_count:room.active_members};
+        });
+        if(method==='resolve_chat') {
+          const room=rooms.find(room=>room.chat_id===(request as {chat_id:string}).chat_id);
+          if(!room)throw new Error('chat_not_found');
+          return {status:'ready',user_id:config.expected_user_id,...room};
+        }
+        const result={status:'ready',user_id:config.expected_user_id,rooms};
+        if(Buffer.byteLength(JSON.stringify(result))>MAX_FRAME-256)throw new Error('catalog_frame_limit');
+        return result;
       }
       throw new Error('unknown_method');
     });
@@ -154,6 +201,7 @@ export async function startSidecar(input: Config, deps: Dependencies = {}) {
       dirty.clear();
       let refreshMetadata = false;
       try {
+        if(policy&&!policy.healthy)throw new Error('policy_unavailable');
         await listener!.start();
         if (terminal || closed) return;
         await client!.acquireSession();
@@ -168,32 +216,40 @@ export async function startSidecar(input: Config, deps: Dependencies = {}) {
           for (const room of rooms) receiver.setTitle(room.chat_id, room.title ?? room.display_name ?? room.chat_id);
         }
         if (full) {
-          await receiver.syncAll();
+          if(policy) {
+            for(const chat of [...approved]) {
+              if(!policy.healthy||terminal||closed)return;
+              try {await receiver.sync(chat);}catch(error){if(isAuthError(error))throw error;}
+            }
+          } else await receiver.syncAll();
           nextFullAt = Date.now() + antiEntropyMs;
         } else {
           for (const chat of batch) {
             if (terminal || closed) return;
-            await receiver.sync(chat);
+            if(!approved.has(chat)||policy&&!policy.healthy)continue;
+            try{await receiver.sync(chat);}catch(error){if(!policy||isAuthError(error))throw error;}
           }
         }
         if (terminal || closed) return;
+        if(policy&&!policy.healthy)throw new Error('policy_unavailable');
         ready = true;
         reason = '';
         backoff = 1000;
       } catch (error) {
         ready = false;
-        for (const chat of batch) dirty.add(chat);
+        for (const chat of batch) if(approved.has(chat))dirty.add(chat);
         // Partial catch-up remains retryable without discarding the failed room.
         fullRequested = true;
         metadataRequested ||= refreshMetadata;
         if (terminal) { /* Preserve KICKOUT and stop; no automatic takeover. */ }
         else if (isAuthError(error)) { terminal = true; reason = 'auth_required'; client!.close(); }
-        else { reason = [...receiver.issues.values()][0] ?? 'reconnecting'; backoff = Math.min(backoff * 2, 30000); }
+        else { reason = policy&&!policy.healthy?'policy_unavailable':[...receiver.issues.values()][0] ?? 'reconnecting'; backoff = Math.min(backoff * 2, 30000); }
       } finally {
         loopRunning = false;
         schedule(ready ? (dirty.size || fullRequested || metadataRequested ? 0 : nextFullAt - Date.now()) : backoff);
       }
     };
+    wake=()=>{if(!bootstrapping)schedule(0);};
     client.onSessionEvent(event => {
       if (event.type === 'kicked') {
         terminal = true; ready = false; reason = 'kicked';
@@ -219,7 +275,11 @@ export async function startSidecar(input: Config, deps: Dependencies = {}) {
       if (isAuthError(error)) { terminal = true; reason = 'auth_required'; }
       else if (!terminal) { reason = 'listener_error'; schedule(backoff); }
     });
+    if(policy){try{await policy.refresh();}catch{}
+      let pulling=false;
+      policyTimer=setInterval(()=>{if(pulling)return;pulling=true;void policy!.refresh().catch(()=>{}).finally(()=>{pulling=false;});},5000);}
     await reconcile();
+    bootstrapping=false;
     if (closed) throw new Error('sidecar_stopped');
     return { close, status, server };
   } catch (error) { close(); throw error; }
