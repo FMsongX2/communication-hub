@@ -19,6 +19,12 @@ Local changes:
   upstream reconnect behavior. The sidecar calls only text and single attachment sends.
 - `KakaoTalkClient` requires an explicit private sync-state directory. Calling
   `login()` without explicit credentials fails and cannot read/extract desktop credentials.
+- Full/search `getChats` requests scan canonical LCHATLIST from zero cursors to
+  explicit EOF instead of trusting the incremental LOGINLIST snapshot. Catalog
+  membership comes only from that scan, excluding stale login entries. Missing
+  pages/status/EOF/cursors, cursor cycles, duplicate-only non-EOF pages, and the
+  50-page bound reject incomplete results. Default nonempty login views remain
+  partial. Offline regressions are in `sidecar/kakao/catalog-completeness.test.ts`.
 - `getLatestLogId` exposes the existing read-only CHATINFO watermark extraction for
   first-run cursor bootstrap. It does not enter a room or mark messages read.
 - Two path aliases become relative imports; SHA-1 input copies into an ArrayBuffer

@@ -1032,27 +1032,28 @@ export class KakaoTalkClient {
         const allChats: ChatData[] = []
         const seenChatIds = new Set<string>()
 
-        collectChats((loginResult.chatDatas ?? []) as ChatData[], allChats, seenChatIds)
+        // LOGINLIST is a device-sync delta after persisted reconnects; its EOF
+        // does not establish catalog completeness. Full/search queries must use
+        // only canonical LCHATLIST pages, starting from zero rather than the
+        // login cursor, so stale/left login entries cannot leak into the catalog.
+        const requireCompleteList = options?.all === true || options?.search !== undefined
+        if (!requireCompleteList) {
+          collectChats((loginResult.chatDatas ?? []) as ChatData[], allChats, seenChatIds)
+        }
 
-        // Paginate via LCHATLIST when explicitly requested (--all / --search) OR when
-        // the login snapshot is empty. New device registrations often return an empty
-        // chatDatas with eof=true because the server has no prior sync state for the
-        // device — LCHATLIST fetches the canonical chat list regardless of device history.
-        const snapshotEmpty = allChats.length === 0
-        if (options?.all || options?.search || snapshotEmpty) {
-          let cursor: ChatListResponse = loginResult
+        if (requireCompleteList || allChats.length === 0) {
+          let lastTokenId = cursorToLong(0)!
+          let lastChatId = cursorToLong(0)!
+          const seenCursors = new Set<string>()
+          let complete = false
           let pages = 0
-          const requireCompleteList = options?.all === true
 
           while (pages < MAX_PAGES) {
-            // Trust eof only when the snapshot had data. When the snapshot was empty
-            // (new device), ignore eof for the first iteration so we always attempt
-            // at least one LCHATLIST call.
-            if (cursor.eof && !snapshotEmpty) break
-            if (cursor.eof && snapshotEmpty && pages > 0) break
-
-            const lastTokenId = cursorToLong(cursor.lastTokenId)
-            const lastChatId = cursorToLong(cursor.lastChatId)
+            const cursorKey = `${lastTokenId.toString()}:${lastChatId.toString()}`
+            if (seenCursors.has(cursorKey)) {
+              throw new Error('LCHATLIST pagination incomplete: repeated cursor')
+            }
+            seenCursors.add(cursorKey)
 
             const response = await session.getChatList(lastTokenId, lastChatId)
             if (requireCompleteList) assertLocoOk(response, 'LCHATLIST')
@@ -1061,21 +1062,37 @@ export class KakaoTalkClient {
               throw new Error('LCHATLIST pagination incomplete: chatDatas unavailable')
             }
             const chatDatas = (body.chatDatas ?? []) as ChatData[]
-            cursor = body
             pages++
+            const previousCount = allChats.length
+            collectChats(chatDatas, allChats, seenChatIds)
+            this.nameCache.ingest(chatDatas)
 
+            if (body.eof === true) {
+              complete = true
+              break
+            }
             if (chatDatas.length === 0) {
-              if (requireCompleteList && body.eof !== true) {
+              if (requireCompleteList) {
                 throw new Error('LCHATLIST pagination incomplete: empty non-EOF page')
               }
               break
             }
-
-            collectChats(chatDatas, allChats, seenChatIds)
-            this.nameCache.ingest(chatDatas)
+            if (requireCompleteList && body.eof !== false) {
+              throw new Error('LCHATLIST pagination incomplete: EOF unavailable')
+            }
+            if (allChats.length === previousCount) {
+              throw new Error('LCHATLIST pagination incomplete: no new chats')
+            }
+            const nextTokenId = cursorToLong(body.lastTokenId)
+            const nextChatId = cursorToLong(body.lastChatId)
+            if (!nextTokenId || !nextChatId) {
+              throw new Error('LCHATLIST pagination incomplete: cursor unavailable')
+            }
+            lastTokenId = nextTokenId
+            lastChatId = nextChatId
           }
 
-          if (requireCompleteList && cursor.eof !== true) {
+          if (requireCompleteList && !complete) {
             throw new Error(`LCHATLIST pagination incomplete after ${pages} pages`)
           }
         }

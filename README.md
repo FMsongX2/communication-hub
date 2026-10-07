@@ -6,7 +6,7 @@ A local Rust service for routing communication and work requests through one hub
 
 **Status: experimental alpha.** Text delivery has been exercised on a real macOS installation; automated native attachment upload still needs end-to-end validation. Automation is disabled in fresh installations.
 
-An opt-in [Kakao LOCO transport and shadow pilot](docs/kakao-loco.md) adds a persistent local SDK sidecar. It is disabled by default; offline checks have passed, while real-account login, live delivery, and deployment validation remain pending.
+An opt-in [Kakao LOCO transport and shadow pilot](docs/kakao-loco.md) adds a persistent local SDK sidecar. It is disabled by default. Owner-authenticated self-chat text, PNG, original PDF, and ZIP delivery have been verified against server receipts and message history, and an initial scoped rollout passed health checks. Lossless end-to-end handling of new real-world calls, screen-locked delivery, and downloaded attachment hashes remain unverified.
 
 ```mermaid
 flowchart LR

@@ -170,10 +170,15 @@ log out or delete credentials on the owner's behalf.
 Offline auth and Keychain IPC contract tests verify explicit inputs, disabled force
 login, rejected missing credentials, non-overwrite behavior, and private shadow
 candidate generation. The Swift helper compiles and its self-test does not access
-Keychain. No account authentication, live protocol messages, phone approvals,
-Keychain insertion, deployed service, latency comparison, or locked-screen send is
-implied by those tests. Record live evidence only after the owner login and rollout
-gates actually complete.
+Keychain. Those offline tests alone do not establish live delivery.
+
+A separate owner-authenticated self-chat pilot verified text, PNG, original PDF,
+and ZIP delivery against server receipts and message history. An initial scoped
+rollout passed health checks, including complete catalog reads after reconnect.
+Private account, room, message, and authentication evidence remains local.
+Lossless end-to-end handling of new real-world calls, screen-locked delivery,
+downloaded attachment hashes, and a comparative latency benchmark remain
+unverified.
 
 ### Owner diagnostics and original files
 
