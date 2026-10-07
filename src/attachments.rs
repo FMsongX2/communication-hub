@@ -175,6 +175,125 @@ fn walk_payloads(
     }
     Ok(())
 }
+// Original delivery is an opt-in room capability, never a path supplied by an agent.
+fn prepare_original(cfg: &Config, key: &str, id: &str, b: &Value) -> Result<Value> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    const LIMIT: u64 = 20 * 1024 * 1024;
+    let input = Path::new(
+        b["source"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing_bundle_source"))?,
+    );
+    if !input.is_absolute()
+        || protected(input)
+        || input
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+    {
+        bail!("protected_or_linked_artifact")
+    }
+    // Reject symlinks in every supplied component, including parent directory aliases.
+    let mut component_path = std::path::PathBuf::new();
+    for component in input.components() {
+        component_path.push(component.as_os_str());
+        if fs::symlink_metadata(&component_path)?
+            .file_type()
+            .is_symlink()
+        {
+            bail!("protected_or_linked_artifact")
+        }
+    }
+    let source = fs::canonicalize(input)?;
+    if protected(&source) || b["kind"] != "file" {
+        bail!("invalid_original_source")
+    }
+    let filename = b["filename"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing_bundle_filename"))?;
+    if !member_safe(filename)
+        || filename.contains('/')
+        || filename.len() > 200
+        || filename.chars().any(char::is_control)
+    {
+        bail!("invalid_bundle_filename")
+    }
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or("");
+    let source_extension = source.extension().and_then(|v| v.to_str()).unwrap_or("");
+    if !["pdf", "png", "json", "txt"].contains(&extension) || extension != source_extension {
+        bail!("unsupported_or_mismatched_original_type")
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&source)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > LIMIT {
+        bail!("artifact_too_large_or_not_file")
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > LIMIT {
+        bail!("artifact_changed_or_too_large")
+    }
+    payload_safe(filename, &bytes)?;
+    match extension {
+        "pdf" if bytes.starts_with(b"%PDF-") && bytes.windows(5).any(|w| w == b"%%EOF") => {}
+        "png" if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => {}
+        "json" => {
+            let _: Value = serde_json::from_slice(&bytes)?;
+        }
+        "txt"
+            if std::str::from_utf8(&bytes).is_ok()
+                && !bytes.contains(&0)
+                && !bytes.starts_with(b"%PDF-")
+                && !bytes.starts_with(b"\x89PNG") => {}
+        _ => bail!("original_signature_mismatch"),
+    }
+    let job = cfg.kakao.sender_ipc.join("file-jobs").join(key);
+    // Check existing staging ancestors before private_dir could follow a link and chmod its target.
+    for ancestor in job.ancestors().take_while(|p| {
+        *p != cfg
+            .kakao
+            .sender_ipc
+            .as_path()
+            .parent()
+            .unwrap_or(Path::new("/"))
+    }) {
+        if let Ok(meta) = fs::symlink_metadata(ancestor)
+            && meta.file_type().is_symlink()
+        {
+            bail!("linked_staging_directory")
+        }
+    }
+    private_dir(&job)?;
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid_bundle_filename"))?;
+    let name = format!("{stem}-{}.{extension}", &key[..8]);
+    let output = job.join(&name);
+    let temporary = job.join(format!(".{}.tmp", crate::adapters::nonce()?));
+    let mut staged = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    staged.write_all(&bytes)?;
+    staged.sync_all()?;
+    // Rename replaces a leaf symlink instead of following it. Source bytes are unchanged.
+    fs::rename(&temporary, &output)?;
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o600))?;
+    fs::File::open(&job)?.sync_all()?;
+    Ok(
+        json!({"path":output,"filename":name,"bytes":bytes.len(),"sha256":digest(&bytes),
+        "entries":1,"bundle_id":id,"delivery":"original"}),
+    )
+}
 fn prepare_generic(cfg: &Config, key: &str, id: &str, b: &Value) -> Result<Value> {
     let input = Path::new(
         b["source"]
@@ -293,6 +412,17 @@ pub fn prepare(cfg: &Config, e: &Event, key: &str, id: &str) -> Result<Value> {
     let b = all
         .get(id)
         .ok_or_else(|| anyhow::anyhow!("unauthorized_attachment_bundle"))?;
+    match b.get("delivery") {
+        None => {}
+        Some(Value::String(mode)) if mode == "zip" => {}
+        Some(Value::String(mode)) if mode == "original" => {
+            if cfg.kakao.loco_target(&e.conversation).is_none() {
+                bail!("original_requires_active_loco_room")
+            }
+            return prepare_original(cfg, key, id, b);
+        }
+        _ => bail!("unknown_attachment_delivery"),
+    }
     let path = |field: &str| -> Result<std::path::PathBuf> {
         Ok(fs::canonicalize(b[field].as_str().ok_or_else(|| {
             anyhow::anyhow!("invalid_bundle_config")

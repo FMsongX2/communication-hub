@@ -23,12 +23,14 @@ export type Receipt = {
   transport: 'loco'; user_id: string; chat_id: string; text_sent: boolean; attachment_sent: boolean;
   input_started: boolean; side_effects_started: boolean; text_log_id?: string; attachment_log_id?: string;
 };
-export type Message = {chat_id: string; log_id: string; author_id: number | string; message: string; sent_at: number};
+export type Message = {chat_id: string; log_id: string; author_id: number | string; message: string; sent_at: number; type?:number; attachment?:Record<string,unknown>|null};
 export type HubEvent = {mode:'shadow'|'active';user_id:string;chat_id:string;log_id:string;author_id:string;body:string;sent_at:number;title:string};
 export type SDKReceipt = {success:boolean;status_code:number;chat_id:string;log_id:string;sent_at:number};
 export interface Client {
   getCredentials(): {userId:string}; isConnected():boolean; acquireSession():Promise<unknown>; close():void;
   getChats(options?:{all?:boolean;resolveTitles?:boolean}):Promise<Array<{chat_id:string;title:string|null;display_name:string|null}>>;
+  getChat?(chatId:string):Promise<{chat_id:string;type:string|number;active_members:number}>;
+  getMemberSnapshot?(chatId:string):Promise<{chat_id:string;active_members:number;members:Array<{user_id:string}>;complete:true;consistency_basis:string}>;
   getLatestLogId(chatId:string):Promise<string>;
   getMessagePage(chatId:string,options:{count:number;from:string}):Promise<{messages:Array<Omit<Message,'chat_id'>>;next_cursor:string|null;complete:boolean}>;
   sendMessage(chatId:string,text:string):Promise<SDKReceipt>;

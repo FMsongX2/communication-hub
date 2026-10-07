@@ -675,3 +675,98 @@ async fn yumi_selects_the_same_approved_bundle_with_tools_disabled() {
             .is_err()
     );
 }
+
+#[test]
+fn original_pdf_is_exact_private_room_scoped_and_loco_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = TempDir::new().unwrap();
+    let root = fs::canonicalize(t.path()).unwrap();
+    let (mut cfg, e) = fixture(&root);
+    let source = root.join("report.pdf");
+    let pdf = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n";
+    fs::write(&source, pdf).unwrap();
+    let register = |source: &Path, kind: &str, filename: &str, delivery: &str| {
+        atomic(&cfg.kakao.legacy_state.join("attachment-bundles.json"), &json!({"rooms":{"team":{"approved":{"kind":kind,"source":source,"filename":filename,"delivery":delivery}}}})).unwrap();
+    };
+    register(&source, "file", "report.pdf", "original");
+    assert!(
+        attachments::prepare(&cfg, &e, &e.key(), "approved")
+            .unwrap_err()
+            .to_string()
+            .contains("active_loco")
+    );
+    cfg.kakao.loco = Some(serde_json::from_value(json!({"socket":root.join("loco.sock"),"mode":"active","expected_user_id":"42","rooms":{"team":"100"}})).unwrap());
+    let artifact = attachments::prepare(&cfg, &e, &e.key(), "approved").unwrap();
+    let staged = Path::new(artifact["path"].as_str().unwrap());
+    assert_eq!(fs::read(staged).unwrap(), pdf);
+    assert_eq!(artifact["sha256"], communication_hub::event::digest(pdf));
+    assert_eq!(artifact["delivery"], "original");
+    assert_eq!(artifact["entries"], 1);
+    assert_eq!(
+        artifact["filename"],
+        format!("report-{}.pdf", &e.key()[..8])
+    );
+    assert_eq!(
+        fs::metadata(staged).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let mut other = e.clone();
+    other.conversation.id = "other".into();
+    assert!(attachments::prepare(&cfg, &other, &other.key(), "approved").is_err());
+    let registry = cfg.kakao.legacy_state.join("attachment-bundles.json");
+    let register = |source: &Path, kind: &str, filename: &str, delivery: &str| {
+        atomic(&registry, &json!({"rooms":{"team":{"approved":{"kind":kind,"source":source,"filename":filename,"delivery":delivery}}}})).unwrap();
+    };
+    for (kind, filename, delivery) in [
+        ("file", "../escape.pdf", "original"),
+        ("file", "report.zip", "original"),
+        ("directory", "report.pdf", "original"),
+        ("zip", "report.pdf", "original"),
+        ("file", "report.pdf", "unexpected"),
+    ] {
+        register(&source, kind, filename, delivery);
+        assert!(attachments::prepare(&cfg, &e, &e.key(), "approved").is_err());
+    }
+    let linked = root.join("linked.pdf");
+    std::os::unix::fs::symlink(&source, &linked).unwrap();
+    register(&linked, "file", "report.pdf", "original");
+    assert!(attachments::prepare(&cfg, &e, &e.key(), "approved").is_err());
+    let linked_parent = root.join("linked-parent");
+    std::os::unix::fs::symlink(&root, &linked_parent).unwrap();
+    register(
+        &linked_parent.join("report.pdf"),
+        "file",
+        "report.pdf",
+        "original",
+    );
+    assert!(attachments::prepare(&cfg, &e, &e.key(), "approved").is_err());
+    register(&source, "file", "report.pdf", "original");
+    for unsafe_bytes in [
+        b"PK\x03\x04pretend PDF".as_slice(),
+        b"wrong signature",
+        b"%PDF-1.4\n/Users/private\n%%EOF",
+        b"%PDF-1.4\n{\"password\":\"secret\"}\n%%EOF",
+    ] {
+        fs::write(&source, unsafe_bytes).unwrap();
+        assert!(attachments::prepare(&cfg, &e, &e.key(), "approved").is_err());
+    }
+    // Sparse oversized source is rejected before reading into memory.
+    fs::File::create(&source)
+        .unwrap()
+        .set_len(20 * 1024 * 1024 + 1)
+        .unwrap();
+    assert!(attachments::prepare(&cfg, &e, &e.key(), "approved").is_err());
+    fs::write(&source, pdf).unwrap();
+    bundle(&cfg, &source, "file"); // Existing registry entries still produce ZIP, even with LOCO active.
+    let zipped = attachments::prepare(&cfg, &e, &e.key(), "approved").unwrap();
+    assert!(zipped["filename"].as_str().unwrap().ends_with(".zip"));
+    let mut archive =
+        zip::ZipArchive::new(fs::File::open(zipped["path"].as_str().unwrap()).unwrap()).unwrap();
+    let mut restored = Vec::new();
+    archive
+        .by_name("report.pdf")
+        .unwrap()
+        .read_to_end(&mut restored)
+        .unwrap();
+    assert_eq!(restored, pdf);
+}

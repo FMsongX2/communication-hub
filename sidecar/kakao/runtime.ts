@@ -1,8 +1,9 @@
+import { z } from 'zod';
 import { mkdirSync, lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import { KakaoTalkClient } from '@communication-hub/agent-messenger-kakao/client';
 import { KakaoTalkListener } from '@communication-hub/agent-messenger-kakao/listener';
-import { Config, ConfigSchema, Client, Message, positiveId } from './types';
+import { Config, ConfigSchema, Client, Message, positiveId, MAX_FRAME } from './types';
 import { readCredentials, type KakaoCredentials } from './auth';
 import { accountLock } from './lock';
 import { Store } from './store';
@@ -87,6 +88,40 @@ export async function startSidecar(input: Config, deps: Dependencies = {}) {
     server = await serve(config.socket_path, async (method, params) => {
       if (method === 'status') return status();
       if (method === 'send') return sender.send(params);
+      if (method === 'room_info' || method === 'message_page') {
+        const id = z.string().refine(positiveId);
+        const roomSchema = z.object({chat_id:id}).strict();
+        const pageSchema = z.object({chat_id:id,from:z.string().refine(v=>v==='0'||positiveId(v)),
+          count:z.number().int().min(1).max(20)}).strict();
+        const request = method === 'room_info' ? roomSchema.parse(params) : pageSchema.parse(params);
+        if (!approved.has(request.chat_id)) throw new Error('room_not_approved');
+        if (terminal || closed || !client!.isConnected()) throw new Error('transport_not_ready');
+        if (client!.getCredentials().userId !== config.expected_user_id) throw new Error('wrong_account');
+        if (method === 'room_info') {
+          if (!client!.getChat || !client!.getMemberSnapshot) throw new Error('diagnostics_unavailable');
+          let chat, members;
+          try {
+            chat = await client!.getChat(request.chat_id);
+            members = await client!.getMemberSnapshot(request.chat_id);
+          } catch (error:any) {
+            const codes = ['get_chat_failed','get_member_snapshot_failed','invalid_access_token','login_rejected','not_authenticated','client_closed'];
+            return {status:'held',reason:'room_info_failed',error_code:codes.includes(error?.code)?error.code:'sdk_read_failed'};
+          }
+          const memberIds = members.members.map(member=>member.user_id);
+          if (chat.chat_id !== request.chat_id || members.chat_id !== request.chat_id || members.complete !== true
+            || chat.active_members !== members.active_members || memberIds.length !== members.active_members
+            || !memberIds.every(positiveId) || new Set(memberIds).size !== memberIds.length) throw new Error('invalid_member_snapshot');
+          return {status:'ready',chat_id:request.chat_id,type:chat.type,active_members:members.active_members,
+            member_ids:memberIds,self_account:config.expected_user_id,complete:true,consistency_basis:members.consistency_basis};
+        }
+        const pageRequest = pageSchema.parse(params);
+        const page = await client!.getMessagePage(pageRequest.chat_id,{from:pageRequest.from,count:pageRequest.count});
+        if (page.messages.length > pageRequest.count) throw new Error('invalid_message_page');
+        const messages = page.messages.map(({log_id,author_id,message,sent_at,type,attachment})=>({log_id,author_id,message,sent_at,type,attachment}));
+        const result = {status:'ready',chat_id:pageRequest.chat_id,messages,next_cursor:page.next_cursor,complete:page.complete};
+        if (Buffer.byteLength(JSON.stringify(result)) > MAX_FRAME - 256) throw new Error('diagnostic_frame_limit');
+        return result;
+      }
       if (method === 'list_rooms') {
         if (terminal || !client!.isConnected()) return status();
         const rooms = await client!.getChats({ all: true, resolveTitles: true });

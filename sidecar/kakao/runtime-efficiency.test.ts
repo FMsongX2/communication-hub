@@ -1,3 +1,4 @@
+import { createConnection } from 'node:net';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -85,5 +86,54 @@ describe('push-driven room synchronization', () => {
     for (const handler of process.listeners('SIGTERM')) handler('SIGTERM');
     resolveCredentials(await f.dependencies.credentials()); expect(await stopped).toBe('sidecar_stopped');
     expect(f.unlocked()).toBe(1); expect(clients).toBe(0);
+  });
+});
+
+async function rpc(path:string,method:string,params:unknown) {
+  return new Promise<any>((resolve,reject)=>{
+    const socket=createConnection(path);let body='';
+    socket.setTimeout(2000,()=>{socket.destroy();reject(new Error('rpc_timeout'));});
+    socket.on('error',reject);
+    socket.on('connect',()=>socket.write(JSON.stringify({id:'offline',method,params})+'\n'));
+    socket.on('data',chunk=>{body+=chunk.toString();if(body.includes('\n')){socket.destroy();resolve(JSON.parse(body.split('\n')[0]));}});
+  });
+}
+describe('private read-only diagnostics',()=>{
+  test('room snapshot uses existing client and omits names/profile metadata',async()=>{
+    const f=fixture();let clients=0,reads=0;
+    f.client.getChat=async chat=>{reads++;return {chat_id:chat,type:'MemoChat',active_members:1,title:'do not return'};};
+    f.client.getMemberSnapshot=async chat=>{reads++;return {chat_id:chat,active_members:1,complete:true,
+      consistency_basis:'stable_double_read_chatinfo_getmem',members:[{user_id:'42',nickname:'do not return'}]};};
+    const app=await startSidecar(f.config,{...f.dependencies,createClient:async()=>{clients++;return f.client;}});cleanups.push(app.close);
+    const result=await rpc(f.config.socket_path,'room_info',{chat_id:'100'});
+    expect(result.ok).toBe(true);expect(result.result.member_ids).toEqual(['42']);expect(result.result.self_account).toBe('42');
+    expect(JSON.stringify(result)).not.toContain('do not return');expect(reads).toBe(2);expect(clients).toBe(1);
+    for(const params of [{chat_id:'999'},{chat_id:'100',extra:true},{chat_id:100}]) {
+      expect((await rpc(f.config.socket_path,'room_info',params)).ok).toBe(false);
+    }
+    expect(reads).toBe(2);
+  });
+  test('snapshot mismatch fails closed and SDK errors expose only bounded code',async()=>{
+    const f=fixture();await start(f);
+    f.client.getChat=async chat=>({chat_id:chat,type:'MemoChat',active_members:1});
+    f.client.getMemberSnapshot=async chat=>({chat_id:chat,active_members:1,complete:true,consistency_basis:'test',members:[{user_id:'42'},{user_id:'43'}]});
+    expect((await rpc(f.config.socket_path,'room_info',{chat_id:'100'})).ok).toBe(false);
+    f.client.getMemberSnapshot=async()=>{throw Object.assign(new Error('private SDK payload'),{code:'get_member_snapshot_failed'});};
+    const response=await rpc(f.config.socket_path,'room_info',{chat_id:'100'});
+    expect(response.result.status).toBe('held');expect(response.result.error_code).toBe('get_member_snapshot_failed');
+    expect(JSON.stringify(response)).not.toContain('private SDK payload');
+  });
+  test('message page validates room/cursor/count, keeps exact receipt data and strips names',async()=>{
+    const f=fixture();await start(f);let reads=0;
+    f.client.getMessagePage=async(chat,options)=>{reads++;expect(chat).toBe('100');expect(options).toEqual({from:'9',count:1});
+      return {messages:[{log_id:'10',author_id:'42',author_name:'private name',message:'test',sent_at:1,type:18,attachment:{name:'test.pdf',size:42}}],complete:true,next_cursor:null};};
+    const response=await rpc(f.config.socket_path,'message_page',{chat_id:'100',from:'9',count:1});
+    expect(response.ok).toBe(true);expect(response.result.messages[0].log_id).toBe('10');
+    expect(response.result.messages[0].attachment.name).toBe('test.pdf');expect(JSON.stringify(response)).not.toContain('private name');
+    for(const params of [{chat_id:'999',from:'9',count:1},{chat_id:'100',from:'-1',count:1},{chat_id:'100',from:'9',count:21},
+      {chat_id:'100',from:'9',count:0},{chat_id:'100',from:'9',count:1,extra:true}]) {
+      expect((await rpc(f.config.socket_path,'message_page',params)).ok).toBe(false);
+    }
+    expect((await rpc(f.config.socket_path,'unknown_method',{})).ok).toBe(false);expect(reads).toBe(1);
   });
 });

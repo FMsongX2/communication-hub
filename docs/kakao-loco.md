@@ -174,3 +174,12 @@ Keychain. No account authentication, live protocol messages, phone approvals,
 Keychain insertion, deployed service, latency comparison, or locked-screen send is
 implied by those tests. Record live evidence only after the owner login and rollout
 gates actually complete.
+
+### Owner diagnostics and original files
+
+The private sidecar IPC now accepts two read-only methods on the existing client/session:
+
+- `room_info` with `{chat_id}` returns only room ID/type, active member count, verified member IDs, self account ID, and snapshot consistency metadata. It requires that exact ID in `allowed_chat_ids`. An SDK member snapshot error returns `status: held` with a bounded error code; it never fabricates owner-only membership.
+- `message_page` with `{chat_id, from, count}` requires the same allowlist, an exclusive decimal log cursor (`"0"` is supported), and an integer count of 1–20. It returns receipt IDs, author IDs, text, attachment metadata, pagination, and completeness over private IPC; names/profile metadata are omitted. Oversized responses fail closed. `scripts/kakao-loco-rpc.py` exposes these reads with `--chat-id`, `--from`, and `--count`.
+
+A room-approved bundle can opt into `"kind":"file", "delivery":"original"` with a safe `filename` and absolute `source`. This is allowed only when that room is mapped to active LOCO. Initial supported original extensions are lowercase PDF, PNG, JSON, and TXT, with source/output extensions matching and signature/parse checks. The maximum is 20 MiB. Sources must be regular files without symlinks in any supplied path component (use the canonical path), protected components, sensitive text, or opaque archive containers. The scanner is not a full PDF content sanitizer. Directory and ZIP original delivery are rejected. The exact inspected bytes are privately staged (0600), retain their extension, and receive the job suffix and SHA-256 receipt metadata with `delivery: original`. No arbitrary file path is accepted from an agent. Existing registrations keep ZIP wrapping; explicit `delivery: zip` also preserves that behavior. Unknown delivery values fail closed.
