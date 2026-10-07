@@ -122,11 +122,14 @@ pub fn authorization_stamp(cfg: &Config, e: &Event) -> Result<String> {
     for id in &ids {
         definitions.insert(id, &r.projects[id]);
     }
-    Ok(digest(serde_json::to_vec(
-        &json!({"version":1,"conversation":e.conversation,"agent":e.agent,
+    let mut stamp = json!({"version":1,"conversation":e.conversation,"agent":e.agent,
         "policy":policy_hash,"persona":persona_hash,"project_bindings":ids,"project_definitions":definitions,
-        "approved_bundles":attachments::bundles(cfg,e)?}),
-    )?))
+        "approved_bundles":attachments::bundles(cfg,e)?});
+    if let Some((loco, chat_id)) = cfg.kakao.loco_target(&e.conversation) {
+        stamp["transport_binding"] =
+            json!({"transport":"loco","user_id":loco.expected_user_id,"chat_id":chat_id});
+    }
+    Ok(digest(serde_json::to_vec(&stamp)?))
 }
 
 /// Current delivery permission, shared by first sends and deferred replay. A binding must

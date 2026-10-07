@@ -71,6 +71,7 @@ pub fn format_reply_as(agent: Agent, body: &str) -> Result<String> {
     }
     Ok(reply)
 }
+pub const LOCO_SOURCE: &str = "kakao_loco";
 pub const NOTIFICATION_SOURCE: &str = "kakao_notification_store";
 pub const OPEN_ROOM_SOURCE: &str = "kakao_open_room";
 pub fn now() -> f64 {
@@ -186,7 +187,7 @@ impl Event {
     }
     pub fn validate(&self, at: f64, initialized: bool) -> Result<()> {
         if self.conversation.provider != "kakao"
-            || ![NOTIFICATION_SOURCE, OPEN_ROOM_SOURCE].contains(&self.source.as_str())
+            || ![NOTIFICATION_SOURCE, OPEN_ROOM_SOURCE, LOCO_SOURCE].contains(&self.source.as_str())
         {
             bail!("unsupported_event_source")
         }

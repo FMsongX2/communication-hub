@@ -29,6 +29,10 @@ enum Command {
     },
     Status,
     Adapters,
+    /// Read-only protocol sidecar readiness and explicit configured bindings.
+    LocoStatus,
+    /// List exact protocol chat IDs for manual binding; never approves rooms.
+    LocoRooms,
     Pause,
     Resume,
     RefreshPolicy,
@@ -55,6 +59,8 @@ enum Command {
         reply: String,
         #[arg(long)]
         sticker: Option<String>,
+        #[arg(long, conflicts_with = "sticker")]
+        bundle: Option<String>,
         #[arg(long)]
         send: bool,
     },
@@ -98,6 +104,19 @@ async fn execute() -> Result<()> {
         }
         Command::Status => daemon::request(&cfg.socket, json!({"method":"status"})).await?,
         Command::Adapters => daemon::request(&cfg.socket, json!({"method":"adapters"})).await?,
+        Command::LocoStatus | Command::LocoRooms => {
+            let loco = cfg
+                .kakao
+                .loco
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("loco_not_configured"))?;
+            let method = if matches!(cli.command, Command::LocoStatus) {
+                "status"
+            } else {
+                "list_rooms"
+            };
+            communication_hub::loco::diagnostic(loco, method).await?
+        }
         Command::Pause => daemon::request(&cfg.socket, json!({"method":"pause"})).await?,
         Command::Resume => daemon::request(&cfg.socket, json!({"method":"resume"})).await?,
         // Stateless calls touch no room thread, so a running hub needs no pause for this check.
@@ -163,6 +182,7 @@ async fn execute() -> Result<()> {
             file,
             reply,
             sticker,
+            bundle,
             send,
         } => {
             if !send || !cfg.external_auto_send {
@@ -186,7 +206,7 @@ async fn execute() -> Result<()> {
                 "controlled",
                 &Plan {
                     reply,
-                    bundle_id: None,
+                    bundle_id: bundle,
                     sticker_id: sticker,
                 },
             )

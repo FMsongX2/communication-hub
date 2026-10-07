@@ -304,7 +304,7 @@ pub async fn resume_locked_delivery(
         return Ok(held("authorization_changed_or_missing"));
     }
     let kakao = crate::adapters::Kakao { cfg: cfg.clone() };
-    let probe = kakao.session_state().await?;
+    let probe = kakao.event_session_state(e).await?;
     if store.retain_deferred_readiness(key, &probe)? {
         return Ok(store.delivery_receipt(key)?.unwrap());
     }
@@ -368,6 +368,16 @@ fn handle(
             notify.notify_one();
             Ok(json!({"resumed":true}))
         }
+        Some("authorize_kakao_loco") => {
+            authorize_loco(cfg, store, &v["params"], sending.load(Ordering::SeqCst))
+        }
+        Some("ingest_kakao_loco") => ingest_loco(
+            cfg,
+            store,
+            &v["event"],
+            notify,
+            processing.load(Ordering::SeqCst) && sending.load(Ordering::SeqCst),
+        ),
         Some("ingest_kakao") => {
             cfg.validate_channel("kakao", &cfg.kakao.account)
                 .map_err(|_| Rejected)?;
@@ -403,6 +413,7 @@ fn handle(
                 event,
                 notify,
                 processing.load(Ordering::SeqCst) && sending.load(Ordering::SeqCst),
+                false,
             )
         }
         Some("ingest") => ingest(
@@ -411,6 +422,7 @@ fn handle(
             serde_json::from_value(v["event"].clone()).map_err(|_| Rejected)?,
             notify,
             processing.load(Ordering::SeqCst) && sending.load(Ordering::SeqCst),
+            false,
         ),
         _ => Err(Rejected.into()),
     }
@@ -424,7 +436,14 @@ fn ingest(
     event: Event,
     notify: &Notify,
     working: bool,
+    protocol: bool,
 ) -> Result<Value> {
+    if protocol != (event.source == crate::event::LOCO_SOURCE) {
+        return Err(Rejected.into());
+    }
+    if !protocol && cfg.kakao.loco_target(&event.conversation).is_some() {
+        return Ok(json!({"status":"ignored","reason":"loco_owns_room"}));
+    }
     cfg.validate_channel(&event.conversation.provider, &event.conversation.account)
         .map_err(|_| Rejected)?;
     let agents: Vec<Agent> = event
@@ -446,7 +465,11 @@ fn ingest(
             };
             store.record_rejected(&event.for_agent(agent), reason)?;
         }
-        return Err(Rejected.into());
+        return if protocol {
+            Ok(json!({"status":"ignored","reason":"no_enabled_agent_tag"}))
+        } else {
+            Err(Rejected.into())
+        };
     }
     if store.reported_by_other_source(&event)? {
         return Ok(json!({"status":"duplicate","reason":"reported_by_other_source"}));
@@ -467,12 +490,14 @@ fn ingest(
         } else {
             None
         };
+        let mut rejection_reason = None;
         let status = match gate.map_or_else(
             || e.validate(now(), initialized),
             |r| Err(anyhow::anyhow!(r)),
         ) {
             Err(reason) => {
                 store.record_rejected(&e, &reason.to_string())?;
+                rejection_reason = Some(reason.to_string());
                 "rejected"
             }
             Ok(()) if store.enqueue(&e)? => {
@@ -487,16 +512,191 @@ fn ingest(
             }
             Ok(()) => "duplicate",
         };
-        results.push(json!({"agent":agent,"event_key":e.key(),"status":status}));
+        results.push(
+            json!({"agent":agent,"event_key":e.key(),"status":status,"reason":rejection_reason}),
+        );
     }
     if queued {
         notify.notify_one()
     }
-    if results.iter().all(|r| r["status"] == "rejected") {
+    if !protocol && results.iter().all(|r| r["status"] == "rejected") {
         return Err(Rejected.into());
     }
     Ok(match results.len() {
         1 => results.remove(0),
         _ => json!({"events":results}),
     })
+}
+
+/// Sidecar callback immediately before each WRITE/upload. This checks the original journaled
+/// lease; it never creates work, claims a new lease, or acquires the transport lock.
+pub fn authorize_loco(cfg: &Config, store: &Store, params: &Value, sending: bool) -> Result<Value> {
+    let held = |reason: &str| Ok(json!({"status":"held","reason":reason}));
+    let Some(key) = params["delivery_id"]
+        .as_str()
+        .filter(|k| !k.is_empty() && k.len() <= 128)
+    else {
+        return held("invalid_delivery_id");
+    };
+    let Some(component) = params["component"]
+        .as_str()
+        .filter(|c| matches!(*c, "text" | "attachment"))
+    else {
+        return held("invalid_component");
+    };
+    let Some((event, plan, phase)) = store.sending_input(key)? else {
+        return held("delivery_not_sending");
+    };
+    let Some((loco, chat_id)) = cfg.kakao.loco_target(&event.conversation) else {
+        return held("loco_binding_not_active");
+    };
+    if loco.validate().is_err()
+        || params["user_id"] != loco.expected_user_id
+        || params["chat_id"] != chat_id
+    {
+        return held("loco_target_mismatch");
+    }
+    if component == "attachment" && plan.bundle_id.is_none() && plan.sticker_id.is_none() {
+        return held("attachment_not_planned");
+    }
+    if !cfg.external_auto_send
+        || (phase != "controlled"
+            && (!sending
+                || crate::config::json_file(&cfg.state.join("control.json"))?["paused"] == true))
+    {
+        return held("delivery_paused");
+    }
+    if let Some(reason) = crate::capabilities::delivery_gate(cfg, store, &event)? {
+        return held(reason);
+    }
+    if validate_deferred_authorization(cfg, &event).is_err() {
+        return held("authorization_changed_or_missing");
+    }
+    Ok(json!({"status":"authorized"}))
+}
+
+/// The private protocol ingress alone constructs authenticated transport metadata. Remote body
+/// content never supplies a local authorization stamp or room binding.
+pub fn ingest_loco(
+    cfg: &Config,
+    store: &Store,
+    raw: &Value,
+    notify: &Notify,
+    working: bool,
+) -> Result<Value> {
+    use crate::{
+        config::LocoMode,
+        event::{Conversation, LOCO_SOURCE, digest},
+        loco::numeric_id,
+    };
+    let rejected = |reason: &str| Ok(json!({"status":"rejected","reason":reason}));
+    cfg.validate_channel("kakao", &cfg.kakao.account)
+        .map_err(|_| Rejected)?;
+    let Some(loco) = &cfg.kakao.loco else {
+        return rejected("loco_not_configured");
+    };
+    if loco.validate().is_err() {
+        return rejected("loco_invalid_configuration");
+    }
+    if raw["mode"] != json!(loco.mode) {
+        return rejected("loco_mode_mismatch");
+    }
+    if raw["user_id"] != loco.expected_user_id {
+        return rejected("loco_account_mismatch");
+    }
+    let Some(chat_id) = raw["chat_id"].as_str().filter(|s| numeric_id(s)) else {
+        return rejected("loco_invalid_chat_id");
+    };
+    let Some((room_id, _)) = loco.rooms.iter().find(|(_, id)| *id == chat_id) else {
+        return rejected("loco_unmapped_chat");
+    };
+    let Some(log_id) = raw["log_id"].as_str().filter(|s| numeric_id(s)) else {
+        return rejected("loco_invalid_log_id");
+    };
+    let Some(author_id) = raw["author_id"].as_str().filter(|s| numeric_id(s)) else {
+        return rejected("loco_invalid_author_id");
+    };
+    let Some(body) = raw["body"].as_str().filter(|s| s.len() <= 65536) else {
+        return rejected("loco_invalid_body");
+    };
+    let Some(sent_at) = raw["sent_at"].as_f64().filter(|n| n.is_finite()) else {
+        return rejected("loco_invalid_time");
+    };
+    let conversation = Conversation {
+        provider: "kakao".into(),
+        account: cfg.kakao.account.clone(),
+        id: room_id.clone(),
+    };
+    // Requiring an existing binding prevents the legacy title-matching registration path from
+    // implicitly approving a protocol room.
+    if store.room(&conversation)?.is_none() {
+        return rejected("loco_room_not_registered");
+    }
+    let key = digest(serde_json::to_vec(&json!([
+        loco.expected_user_id,
+        chat_id,
+        log_id
+    ]))?);
+    if let Some(receipt) = store.loco_ack(&key)? {
+        return Ok(json!({"status":"duplicate","prior":receipt,"durable":true}));
+    }
+    let event = Event {
+        conversation,
+        id: format!("loco:{log_id}"),
+        body: body.into(),
+        title: raw["title"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(200)
+            .collect(),
+        occurred_at: sent_at,
+        source: LOCO_SOURCE.into(),
+        agent: Agent::Yui,
+        metadata: json!({"transport":"loco","user_id":loco.expected_user_id,"chat_id":chat_id,
+            "author_id":author_id,"log_id":log_id,"sender_identity":"protocol_authenticated",
+            "actual_mention_verified":false}),
+    };
+    let mut result = if loco.mode == LocoMode::Shadow {
+        json!({"status":"shadow"})
+    } else {
+        ingest(cfg, store, event.clone(), notify, working, true)?
+    };
+    store.record_loco_ack(&key, &event, &result)?;
+    // Only the committed journal allows the sidecar to consume its history cursor.
+    result["durable"] = json!(true);
+    Ok(result)
+}
+
+#[cfg(test)]
+mod loco_ingress_tests {
+    use super::*;
+    #[test]
+    fn active_mapped_rooms_suppress_ui_ingress_and_generic_cannot_spoof_loco() {
+        let t = tempfile::TempDir::new().unwrap();
+        let p = t.path();
+        let cfg:Config=serde_json::from_value(json!({"state":p.join("state"),"socket":p.join("hub.sock"),"app_server_socket":p.join("app.sock"),"contact_skill":p.join("policy.md"),"lookup_workdir":p,"external_auto_send":false,"kakao":{"enabled":true,"account":"owner","legacy_state":p.join("legacy"),"receiver_app":p.join("receiver"),"sender_app":p.join("sender"),"sender_ipc":p.join("ipc"),"loco":{"socket":p.join("loco.sock"),"expected_user_id":"123","mode":"active","rooms":{"registered-room":"456"}}}})).unwrap();
+        let store = Store::open(cfg.state.clone()).unwrap();
+        let mut e:Event=serde_json::from_value(json!({"conversation":{"provider":"kakao","account":"owner","id":"registered-room"},"id":"1","body":"@[유이] task","title":"room","occurred_at":now(),"source":"kakao_notification_store"})).unwrap();
+        for source in [
+            crate::event::NOTIFICATION_SOURCE,
+            crate::event::OPEN_ROOM_SOURCE,
+        ] {
+            e.source = source.into();
+            assert_eq!(
+                ingest(&cfg, &store, e.clone(), &Notify::new(), false, false).unwrap()["reason"],
+                "loco_owns_room"
+            );
+        }
+        e.source = crate::event::LOCO_SOURCE.into();
+        assert!(ingest(&cfg, &store, e, &Notify::new(), false, false).is_err());
+        assert_eq!(
+            store
+                .db()
+                .unwrap()
+                .query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
 }

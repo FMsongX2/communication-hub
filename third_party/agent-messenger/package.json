@@ -1,0 +1,16 @@
+{
+  "name": "@communication-hub/agent-messenger-kakao",
+  "version": "2.39.0-hub.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./client": "./src/platforms/kakaotalk/client.ts",
+    "./listener": "./src/platforms/kakaotalk/listener.ts",
+    "./types": "./src/platforms/kakaotalk/types.ts",
+    "./auth": "./src/platforms/kakaotalk/auth/kakao-login.ts"
+  },
+  "dependencies": {
+    "bson": "6.10.4",
+    "zod": "4.3.6"
+  }
+}

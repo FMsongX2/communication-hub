@@ -1,7 +1,10 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -70,6 +73,9 @@ fn default_effort() -> String {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KakaoConfig {
+    /// Optional protocol transport. Shadow observes only; active routes only explicit room IDs.
+    #[serde(default)]
+    pub loco: Option<LocoConfig>,
     pub enabled: bool,
     pub account: String,
     pub legacy_state: PathBuf,
@@ -93,6 +99,55 @@ pub struct KakaoConfig {
     #[serde(default)]
     pub locked_ax_text: bool,
 }
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocoMode {
+    Shadow,
+    Active,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocoConfig {
+    pub socket: PathBuf,
+    pub expected_user_id: String,
+    pub mode: LocoMode,
+    /// Existing Hub conversation ID -> exact numeric Kakao chat ID. Never a title lookup.
+    pub rooms: BTreeMap<String, String>,
+}
+impl LocoConfig {
+    pub fn validate(&self) -> Result<()> {
+        let mut ids = std::collections::HashSet::new();
+        if !self.socket.is_absolute()
+            || !crate::loco::numeric_id(&self.expected_user_id)
+            || self.rooms.iter().any(|(room, id)| {
+                room.trim().is_empty()
+                    || room.len() > 512
+                    || !crate::loco::numeric_id(id)
+                    || !ids.insert(id)
+            })
+        {
+            bail!("invalid_loco_configuration")
+        }
+        Ok(())
+    }
+}
+impl KakaoConfig {
+    pub fn loco_target(
+        &self,
+        conversation: &crate::event::Conversation,
+    ) -> Option<(&LocoConfig, &str)> {
+        if conversation.provider != "kakao" || conversation.account != self.account {
+            return None;
+        }
+        let loco = self.loco.as_ref()?;
+        if loco.mode != LocoMode::Active {
+            return None;
+        }
+        loco.rooms
+            .get(&conversation.id)
+            .map(|id| (loco, id.as_str()))
+    }
+}
 fn default_deferred_ttl() -> u64 {
     86400
 }
@@ -109,12 +164,15 @@ impl Config {
         {
             bail!("invalid hub configuration")
         }
+        if let Some(loco) = &c.kakao.loco {
+            loco.validate()?;
+        }
         Ok(c)
     }
     pub fn descriptors(&self) -> Value {
         json!([
             {"provider":"kakao","enabled":self.kakao.enabled,"kind":"chat","transport":"macos_notification_and_ax","capabilities":["receive_calls","reply_text","approved_bundle_attachment","approved_sticker_attachment","deferred_final_delivery"],"sticker_catalog_configured":self.expressions.is_some(),"sticker_formats":["PNG"],"attachment_live_verified":false,"uses_pointer":false,
-            "defer_locked_delivery":self.kakao.defer_locked_delivery,"deferred_delivery_ttl_seconds":self.kakao.deferred_delivery_ttl_seconds,"locked_ax_text_opt_in":self.kakao.locked_ax_text,"locked_ax_text_live_verified":false,"locked_attachment_supported":false},
+            "defer_locked_delivery":self.kakao.defer_locked_delivery,"deferred_delivery_ttl_seconds":self.kakao.deferred_delivery_ttl_seconds,"locked_ax_text_opt_in":self.kakao.locked_ax_text,"locked_ax_text_live_verified":false,"locked_attachment_supported":false,"loco":self.kakao.loco.as_ref().map(|l| json!({"mode":l.mode,"mapped_rooms":l.rooms.len(),"transport":"loco","live_verified":false}))},
             {"provider":"discord","enabled":false,"kind":"chat","status":"adapter_not_implemented","capabilities":[]},
             {"provider":"slack","enabled":false,"kind":"chat","status":"adapter_not_implemented","capabilities":[]},
             {"provider":"notion","enabled":false,"kind":"documents_and_comments","status":"adapter_not_implemented","capabilities":[]}

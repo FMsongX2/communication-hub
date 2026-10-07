@@ -37,6 +37,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS rooms(conversation TEXT PRIMARY KEY,title TEXT NOT NULL,approved REAL,yui INTEGER NOT NULL DEFAULT 1,yumi INTEGER NOT NULL DEFAULT 1,verified_rows INTEGER,verified_at REAL,seen REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS delivery_inputs(delivery TEXT PRIMARY KEY,payload TEXT NOT NULL,created REAL NOT NULL,expires REAL,next_attempt REAL NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS loco_ingress(key TEXT PRIMARY KEY,conversation TEXT NOT NULL,body_hash TEXT NOT NULL,receipt TEXT NOT NULL,created REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS message_sources(conversation TEXT NOT NULL,digest TEXT NOT NULL,source TEXT NOT NULL,occurred REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS message_sources_room ON message_sources(conversation,digest);")?;
         // Rooms already answered in (a verified name) were in use before the registry existed.
@@ -61,6 +62,48 @@ impl Store {
         }
         std::fs::set_permissions(&s.path, std::fs::Permissions::from_mode(0o600))?;
         Ok(s)
+    }
+    /// Only the persisted in-flight lease can authorize a protocol component dispatch.
+    pub fn sending_input(&self, key: &str) -> Result<Option<(Event, Plan, String)>> {
+        let row: Option<(String, String, String, String)> = self.db()?.query_row(
+            "SELECT i.payload,d.plan,d.phase,d.event_key FROM deliveries d JOIN delivery_inputs i ON i.delivery=d.key WHERE d.key=? AND d.status='sending'",
+            [key], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        row.map(|(event, plan, phase, event_key)| {
+            let event: Event = serde_json::from_str(&event)?;
+            if event.key() != event_key {
+                anyhow::bail!("delivery_input_identity_mismatch")
+            }
+            Ok((event, serde_json::from_str(&plan)?, phase))
+        })
+        .transpose()
+    }
+    pub fn delivery_phase(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .db()?
+            .query_row("SELECT phase FROM deliveries WHERE key=?", [key], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+    /// Protocol IDs deduplicate independently of message text. Keep bounded audit metadata only.
+    pub fn loco_ack(&self, key: &str) -> Result<Option<Value>> {
+        let text: Option<String> = self
+            .db()?
+            .query_row("SELECT receipt FROM loco_ingress WHERE key=?", [key], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        text.map(|t| serde_json::from_str(&t).map_err(Into::into))
+            .transpose()
+    }
+    pub fn record_loco_ack(&self, key: &str, event: &Event, receipt: &Value) -> Result<()> {
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        tx.execute("INSERT OR IGNORE INTO loco_ingress(key,conversation,body_hash,receipt,created) VALUES(?,?,?,?,?)",
+            params![key, event.conversation.key(), crate::event::digest(&event.body), serde_json::to_string(receipt)?, now()])?;
+        tx.execute("DELETE FROM loco_ingress WHERE rowid NOT IN (SELECT rowid FROM loco_ingress ORDER BY created DESC LIMIT 10000)", [])?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn expression_history(&self, c: &Conversation) -> Result<Vec<(String, String)>> {
         let db = self.db()?;

@@ -42,7 +42,7 @@ impl Adapter for Kakao {
         expressions::validate_plan(plan)?;
         let route = store.route(&e.conversation)?;
         let name = route.as_deref().unwrap_or(&e.title);
-        if name.is_empty() {
+        if name.is_empty() && self.cfg.kakao.loco_target(&e.conversation).is_none() {
             return Ok(json!({"status":"held","reason":"missing_target"}));
         }
         let deferred_deadline = store.deferred_deadline(key)?;
@@ -69,6 +69,7 @@ impl Adapter for Kakao {
                 )?
             {
                 p["attachment_path"] = artifact["path"].clone();
+                p["attachment_sha256"] = artifact["sha256"].clone();
                 artifact.as_object_mut().unwrap().remove("path");
                 sticker = artifact;
             }
@@ -88,6 +89,17 @@ impl Adapter for Kakao {
                 _ => return Ok(json!({"status":"held","reason":"attachment_validation_failed"})),
             };
             p["attachment_path"] = artifact["path"].clone();
+            p["attachment_sha256"] = artifact["sha256"].clone();
+        }
+        if self.cfg.kakao.loco_target(&e.conversation).is_some() {
+            let mut result = self.authorized_loco_send(store, key, e, &p).await?;
+            // Protocol failures never become deferred UI retries.
+            result["defer_locked_delivery"] = json!(false);
+            if !sticker.is_null() && settle_sticker(&mut result, sticker) {
+                store.verify_expression(key)?;
+            }
+            store.note_intro(&e.conversation, e.agent, &plan.reply, &result)?;
+            return Ok(result);
         }
         let mut result = self.authorized_native_request(store, e, &p).await?;
         result["defer_locked_delivery"] = json!(self.cfg.kakao.defer_locked_delivery);
@@ -134,6 +146,42 @@ fn note_list_size(store: &Store, e: &Event, receipt: &Value) -> Result<()> {
     Ok(())
 }
 impl Kakao {
+    /// Readiness for the exact event route; a mapped protocol room never probes UI state.
+    pub async fn event_session_state(&self, e: &Event) -> Result<Value> {
+        if let Some((loco, _)) = self.cfg.kakao.loco_target(&e.conversation) {
+            return crate::loco::diagnostic(loco, "status").await;
+        }
+        self.session_state().await
+    }
+    async fn authorized_loco_send(
+        &self,
+        store: &Store,
+        key: &str,
+        e: &Event,
+        p: &Value,
+    ) -> Result<Value> {
+        let _guard = ui_lock().lock().await;
+        if let Some(reason) = native_gate(&self.cfg, store, e, true)? {
+            return Ok(crate::loco::held(&reason));
+        }
+        // The CLI's explicit controlled probe is the sole paused-send exception. The phase is
+        // read from the host delivery journal, never accepted from an incoming Event.
+        let controlled = store.delivery_phase(key)?.as_deref() == Some("controlled");
+        if !self.cfg.external_auto_send
+            || (!controlled && json_file(&self.cfg.state.join("control.json"))?["paused"] == true)
+        {
+            return Ok(crate::loco::held("delivery_paused"));
+        }
+        let (loco, chat_id) = self
+            .cfg
+            .kakao
+            .loco_target(&e.conversation)
+            .ok_or_else(|| anyhow::anyhow!("loco_mapping_missing"))?;
+        let params = json!({"delivery_id":key,"expected_user_id":loco.expected_user_id,
+            "chat_id":chat_id,"reply":p["reply"],"attachment_path":p["attachment_path"],
+            "attachment_sha256":p["attachment_sha256"],"expires_at":p["expires_at"]});
+        Ok(crate::loco::send(loco, params).await)
+    }
     /// Read-only session state; does not activate Kakao, write a draft, paste, or send.
     pub async fn session_state(&self) -> Result<Value> {
         self.native_request(&json!({"chat_name":"session-probe","trigger_body":"session-probe",
@@ -142,6 +190,12 @@ impl Kakao {
     /// Runs the sender's full target verification without writing anything, so the scan of the
     /// chat list overlaps model inference and the following send reuses its fresh result.
     pub async fn prewarm(&self, store: &Store, e: &Event) -> Result<Value> {
+        if let Some((loco, _)) = self.cfg.kakao.loco_target(&e.conversation) {
+            if let Some(reason) = native_gate(&self.cfg, store, e, false)? {
+                return Ok(crate::loco::held(&reason));
+            }
+            return crate::loco::diagnostic(loco, "status").await;
+        }
         let route = store.route(&e.conversation)?;
         let name = route.as_deref().unwrap_or(&e.title);
         if name.is_empty() {
@@ -433,6 +487,58 @@ mod late_gate_tests {
                 !cfg.kakao.sender_ipc.exists(),
                 "waiting reply must be gated before request write/helper invoke"
             );
+        }
+    }
+    #[tokio::test]
+    async fn loco_waiting_for_transport_lock_rechecks_policy_and_pause() {
+        for revoke in ["room", "policy", "pause"] {
+            let t = tempfile::TempDir::new().unwrap();
+            let r = t.path();
+            std::fs::write(
+                r.join("policy.md"),
+                "name: contact-other\nCurrent sharing policy\n",
+            )
+            .unwrap();
+            let cfg:Config=serde_json::from_value(json!({"state":r.join("state"),"socket":r.join("hub.sock"),"app_server_socket":r.join("app.sock"),"contact_skill":r.join("policy.md"),"lookup_workdir":r,"external_auto_send":true,"kakao":{"enabled":true,"account":"owner","legacy_state":r.join("legacy"),"receiver_app":r.join("receiver.app"),"sender_app":r.join("sender.app"),"sender_ipc":r.join("ipc"),"loco":{"socket":r.join("loco.sock"),"expected_user_id":"123","mode":"active","rooms":{"room-fixture":"456"}}}})).unwrap();
+            let store = Store::open(cfg.state.clone()).unwrap();
+            let mut e:Event=serde_json::from_value(json!({"conversation":{"provider":"kakao","account":"owner","id":"room-fixture"},"id":"event-fixture","body":"@[유이] task status","title":"fixture","occurred_at":now(),"source":"kakao_loco","metadata":{}})).unwrap();
+            store.note_room_seen(&e.conversation, &e.title).unwrap();
+            store
+                .update_room(&e.conversation.key(), true, true, true)
+                .unwrap();
+            e.metadata["__hub_authorization_stamp"] =
+                json!(capabilities::authorization_stamp(&cfg, &e).unwrap());
+            let lock = ui_lock().lock().await;
+            let signal = std::sync::Arc::new(tokio::sync::Notify::new());
+            let (c, s, event, ready) = (cfg.clone(), store.clone(), e.clone(), signal.clone());
+            let task = tokio::spawn(async move {
+                ready.notify_one();
+                Kakao { cfg: c }
+                    .authorized_loco_send(
+                        &s,
+                        &event.key(),
+                        &event,
+                        &json!({"reply":"fixture","expires_at":now()+75.0}),
+                    )
+                    .await
+            });
+            signal.notified().await;
+            match revoke {
+                "room" => {
+                    store.remove_room(&e.conversation.key()).unwrap();
+                }
+                "policy" => {
+                    std::fs::write(&cfg.contact_skill, "name: contact-other\nUpdated policy\n")
+                        .unwrap()
+                }
+                _ => atomic(&cfg.state.join("control.json"), &json!({"paused":true})).unwrap(),
+            }
+            drop(lock);
+            let result = task.await.unwrap().unwrap();
+            assert_eq!(result["status"], "held");
+            assert_eq!(result["side_effects_started"], false);
+            assert_ne!(result["reason"], "loco_unavailable_before_dispatch");
+            assert!(!cfg.kakao.sender_ipc.exists());
         }
     }
 }

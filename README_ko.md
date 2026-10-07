@@ -6,6 +6,8 @@
 
 **상태: 실험적 알파.** 실제 macOS에서 텍스트 전송을 검증했다. 새 native 자동 파일 업로드의 전체 흐름 검증은 아직 남아 있다. 새 설치에서는 자동화를 꺼둔다.
 
+선택적으로 활성화하는 [Kakao LOCO transport와 shadow pilot](docs/kakao-loco.md)은 상주 local SDK sidecar를 사용한다. 기본값은 비활성화이며 offline 검증을 통과했다. 실제 계정 로그인·실전 전송·배포 검증은 아직 남아 있다.
+
 ```mermaid
 flowchart LR
     K[카카오톡 어댑터] --> E[공통 이벤트]

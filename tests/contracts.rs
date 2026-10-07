@@ -41,6 +41,7 @@ fn config(root: &Path) -> Config {
         expressions: None,
         yumi: None,
         kakao: KakaoConfig {
+            loco: None,
             enabled: true,
             account: "owner".into(),
             legacy_state: root.join("legacy"),

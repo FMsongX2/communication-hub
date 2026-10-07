@@ -1,0 +1,209 @@
+--- a/src/platforms/kakaotalk/media-upload.ts
++++ b/src/platforms/kakaotalk/media-upload.ts
+@@ -2,7 +2,7 @@
+ // on SHIP requests and on the inbound photo `extra` JSON. Verified by inbound
+ // capture of a real KakaoTalk client photo (2026-05).
+ export async function sha1Hex(data: Uint8Array): Promise<string> {
+-  const hashBuf = await crypto.subtle.digest('SHA-1', data)
++  const hashBuf = await crypto.subtle.digest('SHA-1', new Uint8Array(data))
+   return Array.from(new Uint8Array(hashBuf))
+     .map((b) => b.toString(16).padStart(2, '0').toUpperCase())
+     .join('')
+--- a/src/platforms/kakaotalk/client.ts
++++ b/src/platforms/kakaotalk/client.ts
+@@ -1,6 +1,6 @@
+ import { Long } from 'bson'
+ 
+-import { warn } from '@/shared/utils/stderr'
++import { warn } from '../../shared/utils/stderr'
+ 
+ import { type AttachmentInput, type ResolvedAttachment, planAttachments } from './attachment-router'
+ import { isOpenKakaoChatType } from './chat-classifier'
+@@ -8,7 +8,7 @@
+ import { sha1Hex } from './media-upload'
+ import { LANG, PC_OS_NAME, getLocoDeviceConfig } from './protocol/config'
+ import { isSyntheticConnectionClose } from './protocol/login-response'
+-import { uploadMediaToLoco, uploadMultiMediaEntry } from './protocol/media-uploader'
++import { type UploadToLocoResult, uploadMediaToLoco, uploadMultiMediaEntry } from './protocol/media-uploader'
+ import { LocoSession } from './protocol/session'
+ import type { ChatListResponse, LocoPacket, LoginListResponse, SyncState } from './protocol/types'
+ import { KakaoSyncStateStore } from './sync-state-store'
+@@ -581,6 +581,19 @@
+   }
+ }
+ 
++// POST only acknowledges upload admission. COMPLETE must independently accept the
++// registration before a media receipt (or multi-photo FORWARD) can be returned.
++function assertUploadComplete(result: UploadToLocoResult, expectedChatId: string): void {
++  if (result.postStatusCode !== 0 || !result.completePacket) {
++    throw new LocoResponseError('Media upload has no successful POST/COMPLETE receipt', 'transient_or_unknown')
++  }
++  assertLocoOk(result.completePacket, 'COMPLETE')
++  const chatLog = result.completePacket.body.chatLog as Record<string, unknown> | undefined
++  if (chatLog?.chatId !== undefined && longToString(chatLog.chatId) !== expectedChatId) {
++    throw new LocoResponseError('COMPLETE chat ID does not match requested chat', 'transient_or_unknown')
++  }
++}
++
+ function formatMember(member: Record<string, unknown>): KakaoMember {
+   return {
+     user_id: longToString(member.userId),
+@@ -782,6 +795,10 @@
+ }
+ 
+ export class KakaoTalkClient {
++  constructor(private readonly syncStateDir: string) {
++    if (!syncStateDir) throw new Error("Explicit private sync state directory required")
++  }
++
+   private oauthToken: string | null = null
+   private userId: string | null = null
+   private deviceUuid: string | null = null
+@@ -806,14 +823,7 @@
+       this.deviceType = credentials.deviceType ?? 'tablet'
+       return this
+     }
+-    const { ensureKakaoAuth } = await import('./ensure-auth')
+-    const account = await ensureKakaoAuth(accountId)
+-    return this.login({
+-      oauthToken: account.oauth_token,
+-      userId: account.user_id,
+-      deviceUuid: account.device_uuid,
+-      deviceType: account.device_type,
+-    })
++    throw new KakaoTalkError('Explicit credentials are required', 'missing_credentials')
+   }
+ 
+   getCredentials(): { oauthToken: string; userId: string; deviceUuid: string; deviceType: KakaoDeviceType } {
+@@ -885,6 +895,21 @@
+ 
+   isConnected(): boolean {
+     return this.state !== null && !this.closed
++  }
++
++  // CommunicationHub: writes must never be replayed after an ambiguous transport error.
++  private async executeOnce<T>(operation: (state: SessionState) => Promise<T>): Promise<T> {
++    return operation(await this.ensureSession())
++  }
++
++  // Read-only bootstrap; does not enter a room or change its unread watermark.
++  async getLatestLogId(chatId: string): Promise<string> {
++    const parsed = parseChatId(chatId)
++    return this.executeWithReconnect(async ({ session }) => {
++      const response = await session.getChannelInfo(parsed)
++      assertLocoOk(response, 'CHATINFO')
++      return extractChannelMaxLogId(response.body, longToString(parsed)).toString()
++    })
+   }
+ 
+   private async executeWithReconnect<T>(operation: (state: SessionState) => Promise<T>): Promise<T> {
+@@ -921,7 +946,7 @@
+     })
+ 
+     try {
+-      const syncStateStore = new KakaoSyncStateStore()
++      const syncStateStore = new KakaoSyncStateStore(this.syncStateDir)
+       const syncState = await syncStateStore.load(this.deviceUuid!)
+       const loginResult = await session.login(
+         this.oauthToken!,
+@@ -1398,7 +1423,7 @@
+   }
+ 
+   async sendMessage(chatId: string, text: string, options?: { replyTo?: KakaoReplyTarget }): Promise<KakaoSendResult> {
+-    return this.executeWithReconnect(async ({ session }) => {
++    return this.executeOnce(async ({ session }) => {
+       try {
+         const response = options?.replyTo
+           ? await session.sendReply(
+@@ -1425,7 +1450,7 @@
+     const parsedChatId = parseChatId(chatId)
+     const parsedLinkId = opts?.linkId !== undefined ? parseLinkId(opts.linkId) : undefined
+ 
+-    return this.executeWithReconnect(async ({ session }) => {
++    return this.executeOnce(async ({ session }) => {
+       try {
+         const response = await session.sendTyping(parsedChatId, parsedLinkId)
+         // Throw on transport-level failure (incl. synthetic { statusCode: -1 }
+@@ -1597,7 +1622,7 @@
+ 
+     const parsedChatId = parseChatId(chatId)
+ 
+-    return this.executeWithReconnect(async ({ session }) => {
++    return this.executeOnce(async ({ session }) => {
+       try {
+         const mshipResp = await session.shipMultiMedia(
+           parsedChatId,
+@@ -1630,7 +1655,7 @@
+           )
+         }
+ 
+-        await Promise.all(
++        const uploads = await Promise.all(
+           prepared.map((p, i) =>
+             uploadMultiMediaEntry({
+               shipToken: kl[i]!,
+@@ -1648,6 +1673,8 @@
+           ),
+         )
+ 
++        for (const upload of uploads) assertUploadComplete(upload, longToString(parsedChatId))
++
+         const extra: KakaoMultiPhotoExtra = {
+           kl,
+           wl: prepared.map((p) => p.dim.width),
+@@ -1663,6 +1690,8 @@
+           KAKAO_MESSAGE_TYPE.MULTIPHOTO,
+           extra as unknown as Record<string, unknown>,
+         )
++
++        assertLocoOk(forwardResp, 'FORWARD')
+ 
+         return {
+           success: forwardResp.statusCode === 0,
+@@ -1689,7 +1718,7 @@
+     errorCode: string
+   }): Promise<KakaoSendResult> {
+     const parsedChatId = parseChatId(opts.chatId)
+-    return this.executeWithReconnect(async ({ session }) => {
++    return this.executeOnce(async ({ session }) => {
+       try {
+         const shipResp = await session.shipMedia(
+           parsedChatId,
+@@ -1729,6 +1758,8 @@
+           deviceType: this.deviceType,
+         })
+ 
++        assertUploadComplete(uploadRes, longToString(parsedChatId))
++
+         const completeBody = uploadRes.completePacket?.body as Record<string, unknown> | undefined
+         const chatLog = completeBody?.chatLog as Record<string, unknown> | undefined
+         const logId = chatLog?.logId
+@@ -1758,7 +1789,7 @@
+     const parsedWatermark = parseLogId(logId)
+     const parsedLinkId = opts?.linkId !== undefined ? parseLinkId(opts.linkId) : undefined
+ 
+-    return this.executeWithReconnect(async ({ session }) => {
++    return this.executeOnce(async ({ session }) => {
+       try {
+         const response = await session.markRead(parsedChatId, parsedWatermark, parsedLinkId)
+         // Throw on transport-level failure (incl. synthetic { statusCode: -1 }
+@@ -1783,7 +1814,7 @@
+   async leaveChat(chatId: string): Promise<KakaoLeaveChatResult> {
+     const parsedChatId = parseChatId(chatId)
+ 
+-    return this.executeWithReconnect(async ({ session, loginResult }) => {
++    return this.executeOnce(async ({ session, loginResult }) => {
+       try {
+         const response = await session.leaveChat(parsedChatId)
+         // Throw on transport-level failure (incl. synthetic { statusCode: -1 }
+--- a/src/platforms/kakaotalk/protocol/connection.ts
++++ b/src/platforms/kakaotalk/protocol/connection.ts
+@@ -1,7 +1,7 @@
+ import { type Socket, connect as netConnect } from 'node:net'
+ import { connect as tlsConnect } from 'node:tls'
+ 
+-import { debug } from '@/shared/utils/stderr'
++import { debug } from '../../../shared/utils/stderr'
+ 
+ import { LocoCrypto } from './crypto'
+ import { decodePacket, encodePacket } from './packet'

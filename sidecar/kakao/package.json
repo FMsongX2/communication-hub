@@ -1,0 +1,9 @@
+{
+  "name": "@communication-hub/kakao-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {"start": "bun main.ts", "test": "bun test", "typecheck": "tsc --noEmit", "verify-vendor": "bun verify-vendor.ts"},
+  "dependencies": {"@communication-hub/agent-messenger-kakao": "file:../../third_party/agent-messenger", "zod": "4.3.6"},
+  "devDependencies": {"@types/bun": "1.3.10", "typescript": "5.9.3"}
+}
