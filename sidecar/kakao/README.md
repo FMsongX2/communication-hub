@@ -135,7 +135,10 @@ request cannot cross a revocation/re-add boundary. A stale queued request is hel
 
 `list_rooms` and `list_chats` are aliases returning
 `{status:"ready",user_id,rooms:[{chat_id,name,type,member_count}]}` from a fresh,
-complete canonical `getChats({all:true,resolveTitles:true})` scan. Duplicate display
+complete `getChats({all:true,resolveTitles:true})` catalog: all LCHATLIST pages
+plus missing candidates from current-session LOGINLIST and the materialized sync
+snapshot negotiated at login, verified through fresh CHATINFO and stable GETMEM
+membership. Config IDs and unvalidated persisted records are never added. Duplicate display
 names remain distinct by chat ID. These responses include no messages, previews,
 last-message fields, or member profile data. `resolve_chat({chat_id})` rescans that
 same authenticated account catalog and returns only the selected room's metadata;
@@ -150,3 +153,10 @@ actual patched upstream SDK methods. No real login, desktop cache extraction,
 message send, device registration, launch-agent deployment, or live latency claim
 is part of these tests. Follow the owner onboarding/pilot runbook before enabling
 live receive or send.
+
+`catalog_diagnostics` (private IPC only, empty params) returns metadata-only
+source chat-ID sets from the most recent successful full scan: current LOGINLIST,
+negotiated materialized sync IDs, LCHATLIST continuation, separately validated/
+excluded login-only and sync-only candidates, tombstones, and
+returned count. It performs no network calls and contains no raw packet bodies,
+message content, or credentials. Failed full scans clear this diagnostic snapshot.

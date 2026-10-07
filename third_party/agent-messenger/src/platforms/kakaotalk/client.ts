@@ -97,6 +97,8 @@ type ChatData = Record<string, unknown>
 interface SessionState {
   session: LocoSession
   loginResult: LoginListResponse
+  // Materialized from IDs sent by this authenticated session plus its server delta.
+  syncedChatIds?: readonly string[]
 }
 
 class MemberNameCache {
@@ -794,6 +796,19 @@ function buildReplyExtra(target: KakaoReplyTarget): KakaoReplyExtra {
   }
 }
 
+export interface KakaoCatalogDiagnostics {
+  login_chat_ids: string[]
+  synced_chat_ids: string[]
+  validated_sync_only_chat_ids: string[]
+  excluded_sync_only_chat_ids: string[]
+  continuation_chat_ids: string[]
+  validated_login_only_chat_ids: string[]
+  excluded_login_only_chat_ids: string[]
+  tombstone_chat_ids: string[]
+  returned_count: number
+  complete: true
+}
+
 export class KakaoTalkClient {
   constructor(private readonly syncStateDir: string) {
     if (!syncStateDir) throw new Error("Explicit private sync state directory required")
@@ -809,6 +824,7 @@ export class KakaoTalkClient {
   private pushHandlers = new Set<KakaoPushHandler>()
   private sessionEventHandlers = new Set<KakaoSessionEventHandler>()
   private nameCache = new MemberNameCache()
+  private catalogDiagnostics: KakaoCatalogDiagnostics | null = null
 
   async login(
     credentials?: { oauthToken: string; userId: string; deviceUuid?: string; deviceType?: KakaoDeviceType },
@@ -961,7 +977,7 @@ export class KakaoTalkClient {
 
       this.nameCache.ingest((loginResult.chatDatas ?? []) as ChatData[])
 
-      return { session, loginResult }
+      return { session, loginResult, syncedChatIds: Object.freeze(newSyncState.chatIds.map(longToString)) }
     } catch (error) {
       session.close()
       const code = isLoginResponseError(error) ? error.code : 'login_failed'
@@ -1027,16 +1043,20 @@ export class KakaoTalkClient {
   }
 
   async getChats(options?: { all?: boolean; search?: string; resolveTitles?: boolean }): Promise<KakaoChat[]> {
-    return this.executeWithReconnect(async ({ session, loginResult }) => {
+    return this.executeWithReconnect(async ({ session, loginResult, syncedChatIds = [] }) => {
       try {
         const allChats: ChatData[] = []
         const seenChatIds = new Set<string>()
 
-        // LOGINLIST is a device-sync delta after persisted reconnects; its EOF
-        // does not establish catalog completeness. Full/search queries must use
-        // only canonical LCHATLIST pages, starting from zero rather than the
-        // login cursor, so stale/left login entries cannot leak into the catalog.
+        // LOGINLIST contains the first page/delta for this session; LCHATLIST
+        // may omit those already-delivered rooms even when restarted at zero.
+        // Scan all continuation pages, then validate login-only candidates with
+        // current CHATINFO/GETMEM. Retain the materialized IDs negotiated by this
+        // session too; LOGINLIST may be an empty delta when those IDs were sent.
+        // No configuration IDs or unvalidated cached records become results.
         const requireCompleteList = options?.all === true || options?.search !== undefined
+        if (requireCompleteList) this.catalogDiagnostics = null
+        const deleted = new Set<string>((Array.isArray(loginResult.delChatIds) ? loginResult.delChatIds : []).map(longToString))
         if (!requireCompleteList) {
           collectChats((loginResult.chatDatas ?? []) as ChatData[], allChats, seenChatIds)
         }
@@ -1062,6 +1082,7 @@ export class KakaoTalkClient {
               throw new Error('LCHATLIST pagination incomplete: chatDatas unavailable')
             }
             const chatDatas = (body.chatDatas ?? []) as ChatData[]
+            if (Array.isArray(body.delChatIds)) for (const id of body.delChatIds) deleted.add(longToString(id))
             pages++
             const previousCount = allChats.length
             collectChats(chatDatas, allChats, seenChatIds)
@@ -1097,6 +1118,46 @@ export class KakaoTalkClient {
           }
         }
 
+        if (requireCompleteList) {
+          const continuationIds = [...seenChatIds]
+          const loginCandidates = new Map<string, ChatData>()
+          for (const chat of (loginResult.chatDatas ?? []) as ChatData[]) loginCandidates.set(longToString(chat.c), chat)
+          const validated: string[] = []
+          const excluded: string[] = []
+          const candidates = new Map(syncedChatIds.map(id => [id, { c: id } as ChatData]))
+          for (const [id, chat] of loginCandidates) candidates.set(id, chat)
+          for (const [id, candidate] of candidates) {
+            if (seenChatIds.has(id)) continue
+            if (deleted.has(id)) { excluded.push(id); continue }
+            const response = await session.getChannelInfo(parseChatId(id))
+            assertLocoOk(response, 'CHATINFO')
+            const info = extractChannelInfo(response.body, id)
+            if ((info as Record<string, unknown>).left === true) { excluded.push(id); continue }
+            const current = channelInfoToChatData(response.body, id)
+            const members = await this.getMemberSnapshot(id)
+            if (this.state?.session !== session || !this.userId) throw new Error('catalog_session_changed')
+            if (members.active_members !== current.a) throw new Error('catalog_membership_changed')
+            if (!members.members.some(member => member.user_id === this.userId)) { excluded.push(id); continue }
+            current.o = candidate.o
+            collectChats([current], allChats, seenChatIds)
+            this.nameCache.ingest([current])
+            validated.push(id)
+          }
+          // A deletion returned by the current session must also win over an
+          // earlier continuation record, not merely over a login candidate.
+          for (let i = allChats.length - 1; i >= 0; i--) {
+            if (deleted.has(longToString(allChats[i].c))) allChats.splice(i, 1)
+          }
+          this.catalogDiagnostics = {
+            login_chat_ids: [...loginCandidates.keys()], synced_chat_ids: [...syncedChatIds], continuation_chat_ids: continuationIds,
+            validated_login_only_chat_ids: validated.filter(id => loginCandidates.has(id)),
+            excluded_login_only_chat_ids: excluded.filter(id => loginCandidates.has(id)),
+            validated_sync_only_chat_ids: validated.filter(id => !loginCandidates.has(id)),
+            excluded_sync_only_chat_ids: excluded.filter(id => !loginCandidates.has(id)),
+            tombstone_chat_ids: [...deleted], returned_count: allChats.length, complete: true,
+          }
+        }
+
         allChats.sort((a, b) => ((b.o as number) ?? 0) - ((a.o as number) ?? 0))
 
         let results = allChats
@@ -1115,6 +1176,11 @@ export class KakaoTalkClient {
         throw wrapError(error, 'get_chats_failed')
       }
     })
+  }
+
+  /** Metadata-only evidence from the last successful full scan; no packet bodies or credentials. */
+  getCatalogDiagnostics(): KakaoCatalogDiagnostics | null {
+    return this.catalogDiagnostics ? structuredClone(this.catalogDiagnostics) : null
   }
 
   /**

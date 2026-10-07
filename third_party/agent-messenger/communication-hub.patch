@@ -28,7 +28,16 @@
  import { LocoSession } from './protocol/session'
  import type { ChatListResponse, LocoPacket, LoginListResponse, SyncState } from './protocol/types'
  import { KakaoSyncStateStore } from './sync-state-store'
-@@ -581,6 +581,19 @@
+@@ -97,6 +97,8 @@
+ interface SessionState {
+   session: LocoSession
+   loginResult: LoginListResponse
++  // Materialized from IDs sent by this authenticated session plus its server delta.
++  syncedChatIds?: readonly string[]
+ }
+ 
+ class MemberNameCache {
+@@ -581,6 +583,19 @@
    }
  }
  
@@ -48,9 +57,23 @@
  function formatMember(member: Record<string, unknown>): KakaoMember {
    return {
      user_id: longToString(member.userId),
-@@ -782,6 +795,10 @@
+@@ -781,7 +796,24 @@
+   }
  }
  
++export interface KakaoCatalogDiagnostics {
++  login_chat_ids: string[]
++  synced_chat_ids: string[]
++  validated_sync_only_chat_ids: string[]
++  excluded_sync_only_chat_ids: string[]
++  continuation_chat_ids: string[]
++  validated_login_only_chat_ids: string[]
++  excluded_login_only_chat_ids: string[]
++  tombstone_chat_ids: string[]
++  returned_count: number
++  complete: true
++}
++
  export class KakaoTalkClient {
 +  constructor(private readonly syncStateDir: string) {
 +    if (!syncStateDir) throw new Error("Explicit private sync state directory required")
@@ -59,7 +82,15 @@
    private oauthToken: string | null = null
    private userId: string | null = null
    private deviceUuid: string | null = null
-@@ -806,14 +823,7 @@
+@@ -792,6 +824,7 @@
+   private pushHandlers = new Set<KakaoPushHandler>()
+   private sessionEventHandlers = new Set<KakaoSessionEventHandler>()
+   private nameCache = new MemberNameCache()
++  private catalogDiagnostics: KakaoCatalogDiagnostics | null = null
+ 
+   async login(
+     credentials?: { oauthToken: string; userId: string; deviceUuid?: string; deviceType?: KakaoDeviceType },
+@@ -806,14 +839,7 @@
        this.deviceType = credentials.deviceType ?? 'tablet'
        return this
      }
@@ -75,7 +106,7 @@
    }
  
    getCredentials(): { oauthToken: string; userId: string; deviceUuid: string; deviceType: KakaoDeviceType } {
-@@ -885,6 +895,21 @@
+@@ -885,6 +911,21 @@
  
    isConnected(): boolean {
      return this.state !== null && !this.closed
@@ -97,7 +128,7 @@
    }
  
    private async executeWithReconnect<T>(operation: (state: SessionState) => Promise<T>): Promise<T> {
-@@ -921,7 +946,7 @@
+@@ -921,7 +962,7 @@
      })
  
      try {
@@ -106,7 +137,22 @@
        const syncState = await syncStateStore.load(this.deviceUuid!)
        const loginResult = await session.login(
          this.oauthToken!,
-@@ -1007,27 +1032,28 @@
+@@ -936,7 +977,7 @@
+ 
+       this.nameCache.ingest((loginResult.chatDatas ?? []) as ChatData[])
+ 
+-      return { session, loginResult }
++      return { session, loginResult, syncedChatIds: Object.freeze(newSyncState.chatIds.map(longToString)) }
+     } catch (error) {
+       session.close()
+       const code = isLoginResponseError(error) ? error.code : 'login_failed'
+@@ -1002,32 +1043,37 @@
+   }
+ 
+   async getChats(options?: { all?: boolean; search?: string; resolveTitles?: boolean }): Promise<KakaoChat[]> {
+-    return this.executeWithReconnect(async ({ session, loginResult }) => {
++    return this.executeWithReconnect(async ({ session, loginResult, syncedChatIds = [] }) => {
+       try {
          const allChats: ChatData[] = []
          const seenChatIds = new Set<string>()
  
@@ -119,11 +165,15 @@
 -        const snapshotEmpty = allChats.length === 0
 -        if (options?.all || options?.search || snapshotEmpty) {
 -          let cursor: ChatListResponse = loginResult
-+        // LOGINLIST is a device-sync delta after persisted reconnects; its EOF
-+        // does not establish catalog completeness. Full/search queries must use
-+        // only canonical LCHATLIST pages, starting from zero rather than the
-+        // login cursor, so stale/left login entries cannot leak into the catalog.
++        // LOGINLIST contains the first page/delta for this session; LCHATLIST
++        // may omit those already-delivered rooms even when restarted at zero.
++        // Scan all continuation pages, then validate login-only candidates with
++        // current CHATINFO/GETMEM. Retain the materialized IDs negotiated by this
++        // session too; LOGINLIST may be an empty delta when those IDs were sent.
++        // No configuration IDs or unvalidated cached records become results.
 +        const requireCompleteList = options?.all === true || options?.search !== undefined
++        if (requireCompleteList) this.catalogDiagnostics = null
++        const deleted = new Set<string>((Array.isArray(loginResult.delChatIds) ? loginResult.delChatIds : []).map(longToString))
 +        if (!requireCompleteList) {
 +          collectChats((loginResult.chatDatas ?? []) as ChatData[], allChats, seenChatIds)
 +        }
@@ -153,11 +203,12 @@
  
              const response = await session.getChatList(lastTokenId, lastChatId)
              if (requireCompleteList) assertLocoOk(response, 'LCHATLIST')
-@@ -1036,21 +1062,37 @@
+@@ -1036,22 +1082,79 @@
                throw new Error('LCHATLIST pagination incomplete: chatDatas unavailable')
              }
              const chatDatas = (body.chatDatas ?? []) as ChatData[]
 -            cursor = body
++            if (Array.isArray(body.delChatIds)) for (const id of body.delChatIds) deleted.add(longToString(id))
              pages++
 -
 +            const previousCount = allChats.length
@@ -196,9 +247,62 @@
 -          if (requireCompleteList && cursor.eof !== true) {
 +          if (requireCompleteList && !complete) {
              throw new Error(`LCHATLIST pagination incomplete after ${pages} pages`)
++          }
++        }
++
++        if (requireCompleteList) {
++          const continuationIds = [...seenChatIds]
++          const loginCandidates = new Map<string, ChatData>()
++          for (const chat of (loginResult.chatDatas ?? []) as ChatData[]) loginCandidates.set(longToString(chat.c), chat)
++          const validated: string[] = []
++          const excluded: string[] = []
++          const candidates = new Map(syncedChatIds.map(id => [id, { c: id } as ChatData]))
++          for (const [id, chat] of loginCandidates) candidates.set(id, chat)
++          for (const [id, candidate] of candidates) {
++            if (seenChatIds.has(id)) continue
++            if (deleted.has(id)) { excluded.push(id); continue }
++            const response = await session.getChannelInfo(parseChatId(id))
++            assertLocoOk(response, 'CHATINFO')
++            const info = extractChannelInfo(response.body, id)
++            if ((info as Record<string, unknown>).left === true) { excluded.push(id); continue }
++            const current = channelInfoToChatData(response.body, id)
++            const members = await this.getMemberSnapshot(id)
++            if (this.state?.session !== session || !this.userId) throw new Error('catalog_session_changed')
++            if (members.active_members !== current.a) throw new Error('catalog_membership_changed')
++            if (!members.members.some(member => member.user_id === this.userId)) { excluded.push(id); continue }
++            current.o = candidate.o
++            collectChats([current], allChats, seenChatIds)
++            this.nameCache.ingest([current])
++            validated.push(id)
++          }
++          // A deletion returned by the current session must also win over an
++          // earlier continuation record, not merely over a login candidate.
++          for (let i = allChats.length - 1; i >= 0; i--) {
++            if (deleted.has(longToString(allChats[i].c))) allChats.splice(i, 1)
++          }
++          this.catalogDiagnostics = {
++            login_chat_ids: [...loginCandidates.keys()], synced_chat_ids: [...syncedChatIds], continuation_chat_ids: continuationIds,
++            validated_login_only_chat_ids: validated.filter(id => loginCandidates.has(id)),
++            excluded_login_only_chat_ids: excluded.filter(id => loginCandidates.has(id)),
++            validated_sync_only_chat_ids: validated.filter(id => !loginCandidates.has(id)),
++            excluded_sync_only_chat_ids: excluded.filter(id => !loginCandidates.has(id)),
++            tombstone_chat_ids: [...deleted], returned_count: allChats.length, complete: true,
            }
          }
-@@ -1398,7 +1440,7 @@
+ 
+@@ -1073,6 +1176,11 @@
+         throw wrapError(error, 'get_chats_failed')
+       }
+     })
++  }
++
++  /** Metadata-only evidence from the last successful full scan; no packet bodies or credentials. */
++  getCatalogDiagnostics(): KakaoCatalogDiagnostics | null {
++    return this.catalogDiagnostics ? structuredClone(this.catalogDiagnostics) : null
+   }
+ 
+   /**
+@@ -1398,7 +1506,7 @@
    }
  
    async sendMessage(chatId: string, text: string, options?: { replyTo?: KakaoReplyTarget }): Promise<KakaoSendResult> {
@@ -207,7 +311,7 @@
        try {
          const response = options?.replyTo
            ? await session.sendReply(
-@@ -1425,7 +1467,7 @@
+@@ -1425,7 +1533,7 @@
      const parsedChatId = parseChatId(chatId)
      const parsedLinkId = opts?.linkId !== undefined ? parseLinkId(opts.linkId) : undefined
  
@@ -216,7 +320,7 @@
        try {
          const response = await session.sendTyping(parsedChatId, parsedLinkId)
          // Throw on transport-level failure (incl. synthetic { statusCode: -1 }
-@@ -1597,7 +1639,7 @@
+@@ -1597,7 +1705,7 @@
  
      const parsedChatId = parseChatId(chatId)
  
@@ -225,7 +329,7 @@
        try {
          const mshipResp = await session.shipMultiMedia(
            parsedChatId,
-@@ -1630,7 +1672,7 @@
+@@ -1630,7 +1738,7 @@
            )
          }
  
@@ -234,7 +338,7 @@
            prepared.map((p, i) =>
              uploadMultiMediaEntry({
                shipToken: kl[i]!,
-@@ -1648,6 +1690,8 @@
+@@ -1648,6 +1756,8 @@
            ),
          )
  
@@ -243,7 +347,7 @@
          const extra: KakaoMultiPhotoExtra = {
            kl,
            wl: prepared.map((p) => p.dim.width),
-@@ -1663,6 +1707,8 @@
+@@ -1663,6 +1773,8 @@
            KAKAO_MESSAGE_TYPE.MULTIPHOTO,
            extra as unknown as Record<string, unknown>,
          )
@@ -252,7 +356,7 @@
  
          return {
            success: forwardResp.statusCode === 0,
-@@ -1689,7 +1735,7 @@
+@@ -1689,7 +1801,7 @@
      errorCode: string
    }): Promise<KakaoSendResult> {
      const parsedChatId = parseChatId(opts.chatId)
@@ -261,7 +365,7 @@
        try {
          const shipResp = await session.shipMedia(
            parsedChatId,
-@@ -1729,6 +1775,8 @@
+@@ -1729,6 +1841,8 @@
            deviceType: this.deviceType,
          })
  
@@ -270,7 +374,7 @@
          const completeBody = uploadRes.completePacket?.body as Record<string, unknown> | undefined
          const chatLog = completeBody?.chatLog as Record<string, unknown> | undefined
          const logId = chatLog?.logId
-@@ -1758,7 +1806,7 @@
+@@ -1758,7 +1872,7 @@
      const parsedWatermark = parseLogId(logId)
      const parsedLinkId = opts?.linkId !== undefined ? parseLinkId(opts.linkId) : undefined
  
@@ -279,7 +383,7 @@
        try {
          const response = await session.markRead(parsedChatId, parsedWatermark, parsedLinkId)
          // Throw on transport-level failure (incl. synthetic { statusCode: -1 }
-@@ -1783,7 +1831,7 @@
+@@ -1783,7 +1897,7 @@
    async leaveChat(chatId: string): Promise<KakaoLeaveChatResult> {
      const parsedChatId = parseChatId(chatId)
  

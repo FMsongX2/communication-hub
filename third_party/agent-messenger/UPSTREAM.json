@@ -33,7 +33,7 @@
     "src/platforms/kakaotalk/image-meta.ts": "54a9cc193cb0be09cbfd9ad37c49b222b25bf075d719423bb41e7b133160476b",
     "src/platforms/kakaotalk/attachment-router.ts": "7d12d3a1c30eed68b603ee8442cbfda4fb920155ab237808b135e4f90983416e",
     "src/platforms/kakaotalk/sync-state-store.ts": "40ca93b24dbc44b96734efb4dddd4e6e4f5a3ffb71bb7d6cbb276d9c6cda651e",
-    "src/platforms/kakaotalk/client.ts": "9f58d80c00dbcb4b5bcfba38e80a82f069ed02c0520c35409cbb0e26be72369f",
+    "src/platforms/kakaotalk/client.ts": "dd6bf79efe0ae571ae11c903825ada906eaedf7a774dd0bab597a6088c64cec7",
     "src/platforms/kakaotalk/chat-classifier.ts": "63cf2bb922b1683231468b1c29ca9e7c126e1e893ace4d21345375dcc74dac91",
     "src/platforms/kakaotalk/auth/oauth-refresh.ts": "e64d56cd08f7f8a1aabd6513c0d2a9b3eac00541b0e08ad43406c4416b2b840c",
     "src/platforms/kakaotalk/auth/kakao-login.ts": "fa2eef4557cb1433d5e39a3c6201e2ebfe1a1e46e7a872346335f420a5bb4528",

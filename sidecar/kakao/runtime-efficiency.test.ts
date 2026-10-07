@@ -136,4 +136,16 @@ describe('private read-only diagnostics',()=>{
     }
     expect((await rpc(f.config.socket_path,'unknown_method',{})).ok).toBe(false);expect(reads).toBe(1);
   });
+  test('catalog diagnostics are cached metadata-only and use no additional remote reads',async()=>{
+    const f=fixture();const diagnostics={login_chat_ids:['100'],continuation_chat_ids:['101'],validated_login_only_chat_ids:['100'],excluded_login_only_chat_ids:[],tombstone_chat_ids:[],returned_count:2,complete:true as const};
+    f.client.getCatalogDiagnostics=()=>diagnostics;await start(f);const reads=f.metadata();
+    const response=await rpc(f.config.socket_path,'catalog_diagnostics',{});
+    expect(response.result.diagnostics).toEqual(diagnostics);expect(f.metadata()).toBe(reads);
+    expect(response.result).not.toHaveProperty('messages');
+  });
+  test('oversized catalog diagnostics fail within the private IPC frame bound',async()=>{
+    const f=fixture();f.client.getCatalogDiagnostics=()=>({login_chat_ids:Array(20000).fill('123456789012345678'),continuation_chat_ids:[],validated_login_only_chat_ids:[],excluded_login_only_chat_ids:[],tombstone_chat_ids:[],returned_count:20000,complete:true});
+    await start(f);expect((await rpc(f.config.socket_path,'catalog_diagnostics',{})).ok).toBe(false);
+  });
+
 });

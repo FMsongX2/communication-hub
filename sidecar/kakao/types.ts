@@ -30,6 +30,7 @@ export type SDKReceipt = {success:boolean;status_code:number;chat_id:string;log_
 export interface Client {
   getCredentials(): {userId:string}; isConnected():boolean; acquireSession():Promise<unknown>; close():void;
   getChats(options?:{all?:boolean;resolveTitles?:boolean}):Promise<Array<{chat_id:string;title:string|null;display_name:string|null;type?:string|number;active_members?:number}>>;
+  getCatalogDiagnostics?():{synced_chat_ids?:string[];validated_sync_only_chat_ids?:string[];excluded_sync_only_chat_ids?:string[];login_chat_ids:string[];continuation_chat_ids:string[];validated_login_only_chat_ids:string[];excluded_login_only_chat_ids:string[];tombstone_chat_ids:string[];returned_count:number;complete:true}|null;
   getChat?(chatId:string):Promise<{chat_id:string;type:string|number;active_members:number}>;
   getMemberSnapshot?(chatId:string):Promise<{chat_id:string;active_members:number;members:Array<{user_id:string}>;complete:true;consistency_basis:string}>;
   getLatestLogId(chatId:string):Promise<string>;

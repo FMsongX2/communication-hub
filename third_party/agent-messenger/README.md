@@ -19,12 +19,17 @@ Local changes:
   upstream reconnect behavior. The sidecar calls only text and single attachment sends.
 - `KakaoTalkClient` requires an explicit private sync-state directory. Calling
   `login()` without explicit credentials fails and cannot read/extract desktop credentials.
-- Full/search `getChats` requests scan canonical LCHATLIST from zero cursors to
-  explicit EOF instead of trusting the incremental LOGINLIST snapshot. Catalog
-  membership comes only from that scan, excluding stale login entries. Missing
-  pages/status/EOF/cursors, cursor cycles, duplicate-only non-EOF pages, and the
-  50-page bound reject incomplete results. Default nonempty login views remain
-  partial. Offline regressions are in `sidecar/kakao/catalog-completeness.test.ts`.
+- Full/search `getChats` requests scan LCHATLIST from zero cursors to explicit
+  EOF, then reconstruct missing entries from current-session LOGINLIST and its
+  negotiated materialized sync snapshot using fresh CHATINFO and stable GETMEM
+  membership (including the authenticated account). The login request sends prior
+  sync IDs; its response can be an empty delta. `connect` therefore retains the
+  merged IDs after server tombstone removal/upserts for that same session. No
+  config ID or unvalidated persisted record becomes a catalog entry. Explicit left/tombstone/nonmember entries
+  are excluded; uncertain validation fails closed. Pagination completeness checks
+  and the 50-page bound remain. Metadata-only catalog diagnostics explain the
+  two sources without exposing packet bodies, messages, or credentials.
+  Offline regressions are in `sidecar/kakao/catalog-completeness.test.ts`.
 - `getLatestLogId` exposes the existing read-only CHATINFO watermark extraction for
   first-run cursor bootstrap. It does not enter a room or mark messages read.
 - Two path aliases become relative imports; SHA-1 input copies into an ArrayBuffer

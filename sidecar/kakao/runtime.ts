@@ -105,6 +105,15 @@ export async function startSidecar(input: Config, deps: Dependencies = {}) {
       ...(policy?{policy_revision:policy.revision,policy_status:policy.healthy?'ready':'unavailable',rooms:[...approved].map(chat_id=>({chat_id,status:receiver.roomReady(chat_id)?'ready':receiver.issues.has(chat_id)?'held':'sync_pending',reason:receiver.issues.get(chat_id)}))}:{}) });
     server = await serve(config.socket_path, async (method, params) => {
       if (method === 'status') return status();
+      if(method==='catalog_diagnostics') {
+        z.object({}).strict().parse(params);
+        if(terminal||closed||client!.getCredentials().userId!==config.expected_user_id)throw new Error('transport_not_ready');
+        const diagnostics=client!.getCatalogDiagnostics?.();
+        if(!diagnostics)throw new Error('catalog_diagnostics_unavailable');
+        const result={status:'ready',user_id:config.expected_user_id,diagnostics};
+        if(Buffer.byteLength(JSON.stringify(result))>MAX_FRAME-256)throw new Error('catalog_diagnostics_frame_limit');
+        return result;
+      }
       if (method === 'send') return sender.send(params);
       if(method==='refresh_policy') {
         z.object({}).strict().parse(params);
